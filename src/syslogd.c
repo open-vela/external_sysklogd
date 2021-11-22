@@ -65,8 +65,9 @@ static char sccsid[] __attribute__((unused)) =
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef HAVE_UTMP_H
 #include <utmp.h>
-
+#endif
 #include <errno.h>
 #include <err.h>
 #include <fnmatch.h>
@@ -83,7 +84,6 @@ static char sccsid[] __attribute__((unused)) =
 #endif
 
 #include <arpa/inet.h>
-#include <arpa/nameser.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <resolv.h>
@@ -95,6 +95,10 @@ static char sccsid[] __attribute__((unused)) =
 #include "socket.h"
 #include "timer.h"
 #include "compat.h"
+
+#ifndef MIN
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+#endif
 
 char *CacheFile = _PATH_CACHE;
 char *ConfFile  = _PATH_LOGCONF;
@@ -748,8 +752,10 @@ static void create_inet_socket(struct peer *pe)
 
 void untty(void)
 {
+#ifdef HAVE_SETSID
 	if (!Debug)
 		setsid();
+#endif
 }
 
 /*
@@ -1264,7 +1270,35 @@ void printsys(char *msg)
 		} else if (*p == ' ') {
 			/* Linux /dev/kmsg continuation line w/ SUBSYSTEM= DEVICE=, skip */
 			return;
-		} else {
+		}
+#ifdef __NuttX__
+		else if (*p == '[') {
+			buffer.app_name = NULL;
+			char *z = p + 1;
+			while (1) {
+				uint8_t flag = 0;
+				static const char * PriorityNames[] = {
+					" EMERG", " ALERT", "  CRIT", " ERROR",
+					"  WARN", "NOTICE", "  INFO", " DEBUG"
+				};
+				for (uint8_t i = 0; i <= LOG_DEBUG; i++) {
+					if (strncmp(z, PriorityNames[i],
+						    strlen(PriorityNames[i])) == 0) {
+						buffer.pri = i;
+						p = z + strlen(PriorityNames[i]) + 2;
+						flag = 1;
+					}
+				}
+				if (flag)
+					break;
+				z = strchr(z,'[');
+				if(z == NULL || z + 1 == NULL)
+					return;
+				z += 1;
+			}
+		}
+#endif
+		else {
 			/* kernel printf's come out on console */
 			buffer.flags |= IGN_CONS;
 		}
@@ -1393,7 +1427,9 @@ static void logmsg(struct buf_msg *buffer)
 	prilev = LOG_PRI(buffer->pri);
 
 	sigemptyset(&mask);
+#ifdef SIGHUP
 	sigaddset(&mask, SIGHUP);
+#endif
 	sigaddset(&mask, SIGALRM);
 	sigprocmask(SIG_BLOCK, &mask, NULL);
 
@@ -1902,6 +1938,7 @@ void endtty(int signo)
  */
 void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 {
+#ifdef HAVE_UTMP_H
 	static int reenter = 0;
 	struct utmp *uptr;
 	struct utmp  ut;
@@ -1993,6 +2030,7 @@ void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 	/* close the user login file */
 	endutent();
 	reenter = 0;
+#endif
 }
 
 void reapchild(int signo)
@@ -2249,6 +2287,7 @@ void die(int signo)
  */
 static int waitdaemon(int maxwait)
 {
+#ifdef HAVE_FORK
 	struct sigaction sa;
 	pid_t pid, childpid;
 	int status;
@@ -2297,6 +2336,7 @@ static int waitdaemon(int maxwait)
 		(void)close(fd);
 	}
 
+#endif /* HAVE_FORK */
 	return getppid();
 }
 
@@ -2364,10 +2404,16 @@ static void signal_init(void)
 
 	SIGNAL(SIGTERM, die);
 	SIGNAL(SIGINT,  Debug ? die : SIG_IGN);
+#ifdef SIGQUIT
 	SIGNAL(SIGQUIT, Debug ? die : SIG_IGN);
+#endif
 	SIGNAL(SIGUSR1, Debug ? debug_switch : SIG_IGN);
+#ifdef SIGXFSZ
 	SIGNAL(SIGXFSZ, SIG_IGN);
+#endif
+#ifdef SIGHUP
 	SIGNAL(SIGHUP,  reload);
+#endif
 	SIGNAL(SIGCHLD, reapchild);
 }
 
