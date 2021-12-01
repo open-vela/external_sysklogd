@@ -30,6 +30,10 @@ config SYSLOGD_STACKSIZE
 	int "syslogd stack size"
 	default DEFAULT_TASK_STACKSIZE
 
+config SYSLOGD_LINE_MAX
+	int "syslogd line max"
+	default 256
+
 config SYSLOGD_CONFDIR
 	string "Config directory"
 	default "/etc"
