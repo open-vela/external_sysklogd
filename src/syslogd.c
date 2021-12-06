@@ -1273,29 +1273,91 @@ void printsys(char *msg)
 		}
 #ifdef __NuttX__
 		else if (*p == '[') {
-			buffer.app_name = NULL;
-			char *z = p + 1;
-			while (1) {
-				uint8_t flag = 0;
+				p++;
+#ifdef CONFIG_SYSLOG_TIMESTAMP_FORMATTED
+				if (strptime(p, CONFIG_SYSLOG_TIMESTAMP_FORMAT, &buffer.timestamp.tm) == NULL)
+					return;
+				p = strchr(p, ']');
+				if (p == NULL)
+					return;
+#else
+				time_t sec = boot_time + strtoul(p ,&p, 0);
+				if (*p++ != '.') {
+					return;
+				}
+				localtime_r(&sec, &buffer.timestamp.tm);
+				buffer.timestamp.usec = atoi(p) * 1000;
+				p = strchr(p, ']');
+				if (p == NULL)
+					return;
+#endif
+
+#ifdef CONFIG_SMP
+				p = strchr(p, '[');
+				if (p == NULL)
+					return;
+				buffer.sd = ++p;
+				p = strchr(p, ']');
+				if (p == NULL)
+					return;
+				*p++ = '\0';
+#endif
+
+#ifdef CONFIG_SYSLOG_PROCESSID
+				p = strchr(p, '[');
+				if (p == NULL)
+					return;
+				buffer.proc_id = ++p;
+				p = strchr(p, ']');
+				if (p == NULL)
+					return;
+
+				*p++ = '\0';
+#endif
+
+#ifdef CONFIG_SYSLOG_PRIORITY
 				static const char * PriorityNames[] = {
 					" EMERG", " ALERT", "  CRIT", " ERROR",
 					"  WARN", "NOTICE", "  INFO", " DEBUG"
 				};
+				p = strchr(p, '[');
+				if (p == NULL)
+					return;
+				p = p + 1;
+
 				for (uint8_t i = 0; i <= LOG_DEBUG; i++) {
-					if (strncmp(z, PriorityNames[i],
+					if (strncmp(p, PriorityNames[i],
 						    strlen(PriorityNames[i])) == 0) {
 						buffer.pri = i;
-						p = z + strlen(PriorityNames[i]) + 2;
-						flag = 1;
+						p += strlen(PriorityNames[i]);
+						break;
 					}
 				}
-				if (flag)
-					break;
-				z = strchr(z,'[');
-				if(z == NULL || z + 1 == NULL)
+				p = strchr(p, ']');
+				if (p == NULL)
 					return;
-				z += 1;
-			}
+				p += 2;
+#endif
+
+#ifdef CONFIG_SYSLOG_PREFIX
+				p = strchr(p, '[');
+				if (p == NULL)
+					return;
+				buffer.hostname = p + 1;
+				p = strchr(p, ']');
+				if (p == NULL)
+					return;
+				*p++ = '\0';
+#endif
+
+#if CONFIG_TASK_NAME_SIZE > 0 && defined(CONFIG_SYSLOG_PROCESS_NAME)
+				buffer.app_name = p;
+				p = strchr(p, ':');
+				if (p == NULL)
+					return;
+				*(p + 1) = '\0';
+				p += 2;
+#endif
 		}
 #endif
 		else {
@@ -2426,6 +2488,13 @@ static void boot_time_init(void)
 	gettimeofday(&tv, NULL);
 	sysinfo(&si);
 	boot_time = tv.tv_sec - si.uptime;
+#else
+	struct timespec mts;
+	struct timespec rts;
+
+	clock_gettime(CLOCK_MONOTONIC, &mts);
+	clock_gettime(CLOCK_REALTIME, &rts);
+	boot_time = rts.tv_sec - mts.tv_sec;
 #endif
 }
 
