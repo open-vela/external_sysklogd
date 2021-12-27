@@ -243,12 +243,7 @@ vsyslogp_r(int pri, struct syslog_data *data, const char *msgid,
 	} else
 		prlen = 0;
 
-	if (gettimeofday(&tv, NULL) == -1) {
-		tv.tv_sec  = time(NULL);
-		tv.tv_usec = 0;
-	}
-
-	{
+	if (gettimeofday(&tv, NULL) != -1) {
 		/* strftime() implies tzset(), localtime_r() doesn't. */
 		tzset();
 		now = (time_t) tv.tv_sec;
