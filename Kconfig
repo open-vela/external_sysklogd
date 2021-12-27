@@ -28,7 +28,7 @@ config SYSLOGD_PRIORITY
 
 config SYSLOGD_STACKSIZE
 	int "syslogd stack size"
-	default DEFAULT_TASK_STACKSIZE
+	default 4096
 
 config SYSLOGD_LINE_MAX
 	int "syslogd line max"
@@ -39,7 +39,7 @@ config SYSLOGD_CONFDIR
 	default "/etc"
 
 config SYSLOGD_STATEDIR
-	string "State diretory"
+	string "State directory"
 	default "/tmp"
 
 endif
