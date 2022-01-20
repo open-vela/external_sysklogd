@@ -307,6 +307,14 @@ struct filed {
 	int	 f_rotatesz;
 };
 
+/*
+ * Log rotation notifiers
+ */
+struct notifier {
+	SIMPLEQ_ENTRY(notifier)	 n_link;
+	char			*n_program;
+};
+
 void flog(int pri, char *fmt, ...);
 
 #endif /* SYSKLOGD_SYSLOGD_H_ */
