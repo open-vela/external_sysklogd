@@ -65,9 +65,8 @@ static char sccsid[] __attribute__((unused)) =
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef HAVE_UTMP_H
 #include <utmp.h>
-#endif
+
 #include <errno.h>
 #include <err.h>
 #include <fnmatch.h>
@@ -84,6 +83,7 @@ static char sccsid[] __attribute__((unused)) =
 #endif
 
 #include <arpa/inet.h>
+#include <arpa/nameser.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <resolv.h>
@@ -96,10 +96,6 @@ static char sccsid[] __attribute__((unused)) =
 #include "timer.h"
 #include "compat.h"
 
-#ifndef MIN
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
-#endif
-
 char *CacheFile = _PATH_CACHE;
 char *ConfFile  = _PATH_LOGCONF;
 char *PidFile   = _PATH_LOGPID;
@@ -107,6 +103,7 @@ char  ctty[]    = _PATH_CONSOLE;
 
 static volatile sig_atomic_t debugging_on;
 static volatile sig_atomic_t restart;
+static volatile sig_atomic_t rotate_signal;
 
 /*
  * Intervals at which we flush out "message repeated" messages,
@@ -173,6 +170,9 @@ static void parsemsg(const char *from, char *msg);
 static int  opensys(const char *file);
 static void printsys(char *msg);
 static void logmsg(struct buf_msg *buffer);
+static void logrotate(struct filed *f);
+static void rotate_file(struct filed *f);
+static void rotate_all_files(void);
 static void fprintlog_first(struct filed *f, struct buf_msg *buffer);
 static void fprintlog_successive(struct filed *f, int flags);
 void        endtty();
@@ -196,6 +196,7 @@ static void notifier_add(struct notifiers *newn, const char *program);
 static void notifier_invoke(const char *logfile);
 static void notifier_free_all(void);
 void        reload(int);
+static void signal_rotate(int sig);
 static int  validate(struct sockaddr *sa, const char *hname);
 static int	waitdaemon(int);
 static void	timedout(int);
@@ -593,6 +594,12 @@ no_klogd:
 			continue;
 		}
 
+		if (rotate_signal > 0) {
+			rotate_signal = 0;
+			logit("\nReceived SIGUSR2, forcing log rotation.\n");
+			rotate_all_files();
+		}
+
 		if (rc < 0 && errno != EINTR)
 			ERR("select()");
 
@@ -826,10 +833,8 @@ static void create_inet_socket(struct peer *pe)
 
 void untty(void)
 {
-#ifdef HAVE_SETSID
 	if (!Debug)
 		setsid();
-#endif
 }
 
 /*
@@ -1344,97 +1349,7 @@ void printsys(char *msg)
 		} else if (*p == ' ') {
 			/* Linux /dev/kmsg continuation line w/ SUBSYSTEM= DEVICE=, skip */
 			return;
-		}
-#ifdef __NuttX__
-		else if (*p == '[') {
-				p++;
-#ifdef CONFIG_SYSLOG_TIMESTAMP_FORMATTED
-				if (strptime(p, CONFIG_SYSLOG_TIMESTAMP_FORMAT, &buffer.timestamp.tm) == NULL)
-					return;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-#else
-				time_t sec = boot_time + strtoul(p ,&p, 0);
-				if (*p++ != '.') {
-					return;
-				}
-				localtime_r(&sec, &buffer.timestamp.tm);
-				buffer.timestamp.usec = atoi(p) * 1000;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-#endif
-
-#ifdef CONFIG_SMP
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				buffer.sd = ++p;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-				*p++ = '\0';
-#endif
-
-#ifdef CONFIG_SYSLOG_PROCESSID
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				buffer.proc_id = ++p;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-
-				*p++ = '\0';
-#endif
-
-#ifdef CONFIG_SYSLOG_PRIORITY
-				static const char * PriorityNames[] = {
-					" EMERG", " ALERT", "  CRIT", " ERROR",
-					"  WARN", "NOTICE", "  INFO", " DEBUG"
-				};
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				p = p + 1;
-
-				for (uint8_t i = 0; i <= LOG_DEBUG; i++) {
-					if (strncmp(p, PriorityNames[i],
-						    strlen(PriorityNames[i])) == 0) {
-						buffer.pri = i;
-						p += strlen(PriorityNames[i]);
-						break;
-					}
-				}
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-				p += 2;
-#endif
-
-#ifdef CONFIG_SYSLOG_PREFIX
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				buffer.hostname = p + 1;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-				*p++ = '\0';
-#endif
-
-#if CONFIG_TASK_NAME_SIZE > 0 && defined(CONFIG_SYSLOG_PROCESS_NAME)
-				buffer.app_name = p;
-				p = strchr(p, ':');
-				if (p == NULL)
-					return;
-				*(p + 1) = '\0';
-				p += 2;
-#endif
-		}
-#endif
-		else {
+		} else {
 			/* kernel printf's come out on console */
 			buffer.flags |= IGN_CONS;
 		}
@@ -1563,9 +1478,7 @@ static void logmsg(struct buf_msg *buffer)
 	prilev = LOG_PRI(buffer->pri);
 
 	sigemptyset(&mask);
-#ifdef SIGHUP
 	sigaddset(&mask, SIGHUP);
-#endif
 	sigaddset(&mask, SIGALRM);
 	sigprocmask(SIG_BLOCK, &mask, NULL);
 
@@ -1658,7 +1571,7 @@ static void logmsg(struct buf_msg *buffer)
 	sigprocmask(SIG_UNBLOCK, &mask, NULL);
 }
 
-void logrotate(struct filed *f)
+static void logrotate(struct filed *f)
 {
 	struct stat statf;
 
@@ -1669,52 +1582,66 @@ void logrotate(struct filed *f)
 		return;
 
 	/* bug (mostly harmless): can wrap around if file > 4gb */
-	if (S_ISREG(statf.st_mode) && statf.st_size > f->f_rotatesz) {
-		if (f->f_rotatecount > 0) { /* always 0..999 */
-			int  len = strlen(f->f_un.f_fname) + 10 + 5;
-			int  i;
-			char oldFile[len];
-			char newFile[len];
+	if (S_ISREG(statf.st_mode) && statf.st_size > f->f_rotatesz)
+		rotate_file(f);
+}
 
-			/* First age zipped log files */
-			for (i = f->f_rotatecount; i > 1; i--) {
-				snprintf(oldFile, len, "%s.%d.gz", f->f_un.f_fname, i - 1);
-				snprintf(newFile, len, "%s.%d.gz", f->f_un.f_fname, i);
+static void rotate_file(struct filed *f)
+{
+	if (f->f_rotatecount > 0) { /* always 0..999 */
+		int  len = strlen(f->f_un.f_fname) + 10 + 5;
+		int  i;
+		char oldFile[len];
+		char newFile[len];
 
-				/* ignore errors - file might be missing */
-				(void)rename(oldFile, newFile);
-			}
+		/* First age zipped log files */
+		for (i = f->f_rotatecount; i > 1; i--) {
+			snprintf(oldFile, len, "%s.%d.gz", f->f_un.f_fname, i - 1);
+			snprintf(newFile, len, "%s.%d.gz", f->f_un.f_fname, i);
 
-			/* rename: f.8 -> f.9; f.7 -> f.8; ... */
-			for (i = 1; i > 0; i--) {
-				snprintf(oldFile, len, "%s.%d", f->f_un.f_fname, i - 1);
-				snprintf(newFile, len, "%s.%d", f->f_un.f_fname, i);
-
-				if (!rename(oldFile, newFile) && i > 0) {
-					size_t clen = 18 + strlen(newFile) + 1;
-					char cmd[clen];
-
-					snprintf(cmd, sizeof(cmd), "gzip -f %s", newFile);
-					system(cmd);
-				}
-			}
-
-			/* newFile == "f.0" now */
-			snprintf(newFile, len, "%s.0", f->f_un.f_fname);
-			(void)rename(f->f_un.f_fname, newFile);
-			close(f->f_file);
-
-			f->f_file = open(f->f_un.f_fname, O_CREATE | O_NONBLOCK | O_NOCTTY, 0644);
-			if (f->f_file < 0) {
-				f->f_type = F_UNUSED;
-				ERR("Failed re-opening log file %s after rotation", f->f_un.f_fname);
-				return;
-			}
-
-			if (!SIMPLEQ_EMPTY(&nothead))
-				notifier_invoke(f->f_un.f_fname);
+			/* ignore errors - file might be missing */
+			(void)rename(oldFile, newFile);
 		}
-		ftruncate(f->f_file, 0);
+
+		/* rename: f.8 -> f.9; f.7 -> f.8; ... */
+		for (i = 1; i > 0; i--) {
+			snprintf(oldFile, len, "%s.%d", f->f_un.f_fname, i - 1);
+			snprintf(newFile, len, "%s.%d", f->f_un.f_fname, i);
+
+			if (!rename(oldFile, newFile) && i > 0) {
+				size_t clen = 18 + strlen(newFile) + 1;
+				char cmd[clen];
+
+				snprintf(cmd, sizeof(cmd), "gzip -f %s", newFile);
+				system(cmd);
+			}
+		}
+
+		/* newFile == "f.0" now */
+		snprintf(newFile, len, "%s.0", f->f_un.f_fname);
+		(void)rename(f->f_un.f_fname, newFile);
+		close(f->f_file);
+
+		f->f_file = open(f->f_un.f_fname, O_CREATE | O_NONBLOCK | O_NOCTTY, 0644);
+		if (f->f_file < 0) {
+			f->f_type = F_UNUSED;
+			ERR("Failed re-opening log file %s after rotation", f->f_un.f_fname);
+			return;
+		}
+
+		if (!SIMPLEQ_EMPTY(&nothead))
+			notifier_invoke(f->f_un.f_fname);
+	}
+	ftruncate(f->f_file, 0);
+}
+
+static void rotate_all_files(void)
+{
+	struct filed *f;
+
+	SIMPLEQ_FOREACH(f, &fhead, f_link) {
+		if (f->f_type == F_FILE && f->f_rotatesz)
+			rotate_file(f);
 	}
 }
 
@@ -2077,7 +2004,6 @@ void endtty(int signo)
  */
 void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 {
-#ifdef HAVE_UTMP_H
 	static int reenter = 0;
 	struct utmp *uptr;
 	struct utmp  ut;
@@ -2169,7 +2095,6 @@ void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 	/* close the user login file */
 	endutent();
 	reenter = 0;
-#endif
 }
 
 void reapchild(int signo)
@@ -2426,7 +2351,6 @@ void die(int signo)
  */
 static int waitdaemon(int maxwait)
 {
-#ifdef HAVE_FORK
 	struct sigaction sa;
 	pid_t pid, childpid;
 	int status;
@@ -2475,7 +2399,6 @@ static int waitdaemon(int maxwait)
 		(void)close(fd);
 	}
 
-#endif /* HAVE_FORK */
 	return getppid();
 }
 
@@ -2543,16 +2466,11 @@ static void signal_init(void)
 
 	SIGNAL(SIGTERM, die);
 	SIGNAL(SIGINT,  Debug ? die : SIG_IGN);
-#ifdef SIGQUIT
 	SIGNAL(SIGQUIT, Debug ? die : SIG_IGN);
-#endif
 	SIGNAL(SIGUSR1, Debug ? debug_switch : SIG_IGN);
-#ifdef SIGXFSZ
+	SIGNAL(SIGUSR2, signal_rotate);
 	SIGNAL(SIGXFSZ, SIG_IGN);
-#endif
-#ifdef SIGHUP
 	SIGNAL(SIGHUP,  reload);
-#endif
 	SIGNAL(SIGCHLD, reapchild);
 }
 
@@ -2565,13 +2483,6 @@ static void boot_time_init(void)
 	gettimeofday(&tv, NULL);
 	sysinfo(&si);
 	boot_time = tv.tv_sec - si.uptime;
-#else
-	struct timespec mts;
-	struct timespec rts;
-
-	clock_gettime(CLOCK_MONOTONIC, &mts);
-	clock_gettime(CLOCK_REALTIME, &rts);
-	boot_time = rts.tv_sec - mts.tv_sec;
 #endif
 }
 
@@ -3558,6 +3469,15 @@ static void notifier_free_all(void)
 void reload(int signo)
 {
 	restart++;
+}
+
+/*
+ * SIGUSR2: forced rotation for so-configured files as soon as possible.
+ */
+static void signal_rotate(int sig)
+{
+	(void)sig;
+	rotate_signal++;
 }
 
 /**
