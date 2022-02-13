@@ -290,7 +290,6 @@ int usage(int code)
 	       "  -F        Run in foreground, required when monitored by init(1)\n"
 	       "  -f FILE   Alternate .conf file, default: %s\n"
 	       "  -k        Allow logging with facility 'kernel', otherwise remapped to 'user'\n"
-	       "  -K        Keep kernel timestamp, even after initial ring buffer emptying\n"
 	       "  -m MINS   Interval between MARK messages, 0 to disable, default: 20 min\n"
 	       "  -n        Disable DNS query for every request\n"
 	       "  -P FILE   File to store the process ID, default: %s\n"
@@ -302,6 +301,7 @@ int usage(int code)
 	       "  -s        Operate in secure mode, do not log messages from remote machines.\n"
 	       "            If specified twice, no socket at all will be opened, which also\n"
 	       "            disables support for logging to remote machines.\n"
+	       "  -t        Keep kernel timestamp, even after initial ring buffer emptying\n"
 	       "  -T        Use local time and date for messages received from remote hosts\n"
 	       "  -?        Show this help text\n"
 	       "  -v        Show program version and exit\n"
@@ -322,7 +322,7 @@ int main(int argc, char *argv[])
 	int pflag = 0, bflag = 0;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "46Aa:b:C:dHFf:Kkm:nP:p:r:sTv?")) != EOF) {
+	while ((ch = getopt(argc, argv, "46Aa:b:C:dHFf:km:nP:p:r:sTtv?")) != EOF) {
 		switch ((char)ch) {
 		case '4':
 			family = PF_INET;
@@ -377,10 +377,6 @@ int main(int argc, char *argv[])
 			KeepKernFac = 1;
 			break;
 
-		case 'K':	/* keep/trust kernel timestamp always */
-			KeepKernTime = 1;
-			break;
-
 		case 'm': /* mark interval */
 			MarkInterval = atoi(optarg) * 60;
 			break;
@@ -416,6 +412,10 @@ int main(int argc, char *argv[])
 
 		case 'T':
 			RemoteAddDate = 1;
+			break;
+
+		case 't':	/* keep/trust kernel timestamp always */
+			KeepKernTime = 1;
 			break;
 
 		case 'v':
@@ -588,7 +588,14 @@ static void kernel_cb(int fd, void *arg)
 
 static int opensys(const char *file)
 {
+//	struct stat st;
 	int fd;
+
+//	sleep(300);
+//	return 1;
+
+//	if (stat(file, &st) || !S_ISCHR(st.st_mode))
+//		return 1;
 
 	fd = open(file, O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
 	if (fd < 0)
