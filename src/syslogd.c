@@ -65,9 +65,8 @@ static char sccsid[] __attribute__((unused)) =
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef HAVE_UTMP_H
 #include <utmp.h>
-#endif
+
 #include <errno.h>
 #include <err.h>
 #include <fnmatch.h>
@@ -84,6 +83,7 @@ static char sccsid[] __attribute__((unused)) =
 #endif
 
 #include <arpa/inet.h>
+#include <arpa/nameser.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <resolv.h>
@@ -95,10 +95,6 @@ static char sccsid[] __attribute__((unused)) =
 #include "socket.h"
 #include "timer.h"
 #include "compat.h"
-
-#ifndef MIN
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
-#endif
 
 char *CacheFile = _PATH_CACHE;
 char *ConfFile  = _PATH_LOGCONF;
@@ -129,6 +125,7 @@ static int	  Debug;		/* debug flag */
 static int	  Foreground = 0;	/* don't fork - don't run in daemon mode */
 static time_t	  boot_time;		/* Offset for printsys() */
 static uint64_t	  sys_seqno = 0;	/* Last seen kernel log message */
+static int	  sys_seqno_init;	/* Timestamp can be in the past, use 'now' after first read */
 static int	  resolve = 1;		/* resolve hostname */
 static char	  LocalHostName[MAXHOSTNAMELEN + 1]; /* our hostname */
 static char	 *LocalDomain;			     /* our local domain name */
@@ -144,6 +141,7 @@ static int	  RemoteAddDate;	  /* Always set the date on remote messages */
 static int	  RemoteHostname;	  /* Log remote hostname from the message */
 
 static int	  KeepKernFac;		  /* Keep remotely logged kernel facility */
+static int	  KeepKernTime;		  /* Keep kernel timestamp, evern after initial read */
 
 static off_t	  RotateSz = 0;		  /* Max file size (bytes) before rotating, disabled by default */
 static int	  RotateCnt = 5;	  /* Max number (count) of log files to keep, set with -c <NUM> */
@@ -172,6 +170,7 @@ void        wallmsg(struct filed *f, struct iovec *iov, int iovcnt);
 void        reapchild();
 const char *cvtaddr(struct sockaddr_storage *f, int len);
 const char *cvthname(struct sockaddr *f, socklen_t len);
+static void forw_lookup(struct filed *f);
 void        domark(void *arg);
 void        doflush(void *arg);
 void        debug_switch();
@@ -228,6 +227,7 @@ static void sys_seqno_load(void)
 			break; /* str began with a number but has junk left over at the end */
 
 		sys_seqno = val;
+		sys_seqno_init = 1; /* Ignore sys timestamp from now */
 	}
 	fclose(fp);
 }
@@ -248,13 +248,15 @@ static void sys_seqno_save(void)
 	fclose(fp);
 
 	prev = sys_seqno;
+
+	sys_seqno_init = 1;	/* Ignore sys timestamp from now */
 }
 
 int usage(int code)
 {
 	printf("Usage:\n"
-	       "  syslogd [-46AdFknsTv?] [-a PEER] [-b NAME] [-f FILE] [-m INTERVAL]\n"
-	       "                         [-P PID_FILE] [-p SOCK_PATH] [-r SIZE[:NUM]]\n"
+	       "  syslogd [-46AdFKknsTv?] [-a PEER] [-b NAME] [-f FILE] [-m INTERVAL]\n"
+	       "                          [-P PID_FILE] [-p SOCK_PATH] [-r SIZE[:NUM]]\n"
 	       "Options:\n"
 	       "  -4        Force IPv4 only\n"
 	       "  -6        Force IPv6 only\n"
@@ -295,6 +297,7 @@ int usage(int code)
 	       "  -s        Operate in secure mode, do not log messages from remote machines.\n"
 	       "            If specified twice, no socket at all will be opened, which also\n"
 	       "            disables support for logging to remote machines.\n"
+	       "  -t        Keep kernel timestamp, even after initial ring buffer emptying\n"
 	       "  -T        Use local time and date for messages received from remote hosts\n"
 	       "  -?        Show this help text\n"
 	       "  -v        Show program version and exit\n"
@@ -315,7 +318,7 @@ int main(int argc, char *argv[])
 	int pflag = 0, bflag = 0;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "46Aa:b:C:dHFf:km:nP:p:r:sTv?")) != EOF) {
+	while ((ch = getopt(argc, argv, "46Aa:b:C:dHFf:km:nP:p:r:sTtv?")) != EOF) {
 		switch ((char)ch) {
 		case '4':
 			family = PF_INET;
@@ -405,6 +408,10 @@ int main(int argc, char *argv[])
 
 		case 'T':
 			RemoteAddDate = 1;
+			break;
+
+		case 't':	/* keep/trust kernel timestamp always */
+			KeepKernTime = 1;
 			break;
 
 		case 'v':
@@ -577,7 +584,14 @@ static void kernel_cb(int fd, void *arg)
 
 static int opensys(const char *file)
 {
+//	struct stat st;
 	int fd;
+
+//	sleep(300);
+//	return 1;
+
+//	if (stat(file, &st) || !S_ISCHR(st.st_mode))
+//		return 1;
 
 	fd = open(file, O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
 	if (fd < 0)
@@ -694,6 +708,9 @@ static int nslookup(const char *host, const char *service, struct addrinfo **ai)
 	if (!node || !node[0])
 		node = NULL;
 
+	/* Reset resolver cache and retry name lookup */
+	res_init();
+
 	logit("nslookup '%s:%s'\n", node ?: "none", service);
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_flags    = !node ? AI_PASSIVE : 0;
@@ -738,10 +755,8 @@ static void create_inet_socket(struct peer *pe)
 
 void untty(void)
 {
-#ifdef HAVE_SETSID
 	if (!Debug)
 		setsid();
-#endif
 }
 
 /*
@@ -1015,7 +1030,7 @@ bad:
 static void
 parsemsg_rfc3164(const char *from, int pri, char *msg)
 {
-	struct logtime timestamp_remote;
+	struct logtime timestamp_remote = { 0 };
 	struct buf_msg buffer;
 	struct tm tm_parsed;
 	size_t i, msglen;
@@ -1036,8 +1051,8 @@ parsemsg_rfc3164(const char *from, int pri, char *msg)
 		msg += RFC3164_DATELEN + 1;
 
 		if (!RemoteAddDate) {
+			time_t t_now, t_remote;
 			struct tm tm_now;
-			time_t t_now;
 			int year;
 
 			/*
@@ -1052,16 +1067,18 @@ parsemsg_rfc3164(const char *from, int pri, char *msg)
 			 * This loop can only run for at most three
 			 * iterations before terminating.
 			 */
-			t_now = boot_time + timer_now();
+			t_now = time(NULL);
 			localtime_r(&t_now, &tm_now);
 			for (year = tm_now.tm_year + 1;; --year) {
-				assert(year >= tm_now.tm_year - 1);
+				if (year < tm_now.tm_year - 1)
+					break;
 				timestamp_remote.tm = tm_parsed;
 				timestamp_remote.tm.tm_year = year;
 				timestamp_remote.tm.tm_isdst = -1;
 				timestamp_remote.usec = 0;
-				if (mktime(&timestamp_remote.tm) <
-				    t_now + 7 * 24 * 60 * 60)
+				t_remote = mktime(&timestamp_remote.tm);
+				if ((t_remote != (time_t)-1) &&
+				    (t_remote - t_now) < 7 * 24 * 60 * 60)
 					break;
 			}
 			buffer.timestamp = timestamp_remote;
@@ -1195,7 +1212,7 @@ void printsys(char *msg)
 				++p;
 		} else if (isdigit(*p)) {
 			/* Linux /dev/kmsg: "pri,seq#,msec,flag[,..];msg" */
-			time_t now = boot_time;
+			time_t now;
 
 			/* pri */
 			buffer.pri = 0;
@@ -1224,8 +1241,27 @@ void printsys(char *msg)
 			/* timestamp */
 			while (isdigit(*p))
 				ustime = 10 * ustime + (*p++ - '0');
-			now += ustime / 1000000;
-			buffer.timestamp.usec = ustime % 1000000;
+
+			/*
+			 * When syslogd starts up, we assume this happens at
+			 * close to system boot, we read all kernel logs from
+			 * /dev/kmsg (Linux) and calculate the precise time
+			 * stamp using boot_time + usec to get the time of a
+			 * log entry.  However, since the kernel time stamp
+			 * is not adjusted for suspend/resume it can be many
+			 * days (!) off after a few weeks of uptime.  It has
+			 * turned out to be quite an interesting problem to
+			 * compensate for, so at runtime we instead use the
+			 * current time of any new kernel messages.
+			 *     -- Joachim Wiberg Nov 23, 2021
+			 */
+			if (KeepKernTime || !sys_seqno_init) {
+				now = boot_time + ustime / 1000000;
+				buffer.timestamp.usec = ustime % 1000000;
+				localtime_r(&now, &buffer.timestamp.tm);
+			} else
+				now = time(NULL);
+
 			localtime_r(&now, &buffer.timestamp.tm);
 
 			/* skip flags for now */
@@ -1235,97 +1271,7 @@ void printsys(char *msg)
 		} else if (*p == ' ') {
 			/* Linux /dev/kmsg continuation line w/ SUBSYSTEM= DEVICE=, skip */
 			return;
-		}
-#ifdef __NuttX__
-		else if (*p == '[') {
-				p++;
-#ifdef CONFIG_SYSLOG_TIMESTAMP_FORMATTED
-				if (strptime(p, CONFIG_SYSLOG_TIMESTAMP_FORMAT, &buffer.timestamp.tm) == NULL)
-					return;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-#else
-				time_t sec = boot_time + strtoul(p ,&p, 0);
-				if (*p++ != '.') {
-					return;
-				}
-				localtime_r(&sec, &buffer.timestamp.tm);
-				buffer.timestamp.usec = atoi(p) * 1000;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-#endif
-
-#ifdef CONFIG_SMP
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				buffer.sd = ++p;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-				*p++ = '\0';
-#endif
-
-#ifdef CONFIG_SYSLOG_PROCESSID
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				buffer.proc_id = ++p;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-
-				*p++ = '\0';
-#endif
-
-#ifdef CONFIG_SYSLOG_PRIORITY
-				static const char * PriorityNames[] = {
-					" EMERG", " ALERT", "  CRIT", " ERROR",
-					"  WARN", "NOTICE", "  INFO", " DEBUG"
-				};
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				p = p + 1;
-
-				for (uint8_t i = 0; i <= LOG_DEBUG; i++) {
-					if (strncmp(p, PriorityNames[i],
-						    strlen(PriorityNames[i])) == 0) {
-						buffer.pri = i;
-						p += strlen(PriorityNames[i]);
-						break;
-					}
-				}
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-				p += 2;
-#endif
-
-#ifdef CONFIG_SYSLOG_PREFIX
-				p = strchr(p, '[');
-				if (p == NULL)
-					return;
-				buffer.hostname = p + 1;
-				p = strchr(p, ']');
-				if (p == NULL)
-					return;
-				*p++ = '\0';
-#endif
-
-#if CONFIG_TASK_NAME_SIZE > 0 && defined(CONFIG_SYSLOG_PROCESS_NAME)
-				buffer.app_name = p;
-				p = strchr(p, ':');
-				if (p == NULL)
-					return;
-				*(p + 1) = '\0';
-				p += 2;
-#endif
-		}
-#endif
-		else {
+		} else {
 			/* kernel printf's come out on console */
 			buffer.flags |= IGN_CONS;
 		}
@@ -1430,8 +1376,13 @@ static void logmsg(struct buf_msg *buffer)
 	int fac, prilev;
 
 	logit("logmsg: %s, flags %x, from %s, app-name %s procid %s msgid %s sd %s msg %s\n",
-	      textpri(buffer->pri), buffer->flags, buffer->hostname, buffer->app_name,
-	      buffer->proc_id, buffer->msgid, buffer->sd, buffer->msg);
+	      textpri(buffer->pri), buffer->flags,
+	      buffer->hostname ? buffer->hostname : "nil",
+	      buffer->app_name ? buffer->app_name : "nil",
+	      buffer->proc_id  ? buffer->proc_id  : "nil",
+	      buffer->msgid    ? buffer->msgid    : "nil",
+	      buffer->sd       ? buffer->sd       : "nil",
+	      buffer->msg);
 
 	/* Messages generated by syslogd itself may not have a timestamp */
 	check_timestamp(buffer);
@@ -1449,9 +1400,7 @@ static void logmsg(struct buf_msg *buffer)
 	prilev = LOG_PRI(buffer->pri);
 
 	sigemptyset(&mask);
-#ifdef SIGHUP
 	sigaddset(&mask, SIGHUP);
-#endif
 	sigaddset(&mask, SIGALRM);
 	sigprocmask(SIG_BLOCK, &mask, NULL);
 
@@ -1631,8 +1580,8 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		fwd_suspend = timer_now() - f->f_time;
 		if (fwd_suspend >= INET_SUSPEND_TIME) {
 			logit("\nForwarding suspension over, retrying FORW ");
-			f->f_type = F_FORW;
-			goto f_forw;
+			f->f_type = F_FORW_UNKN;
+			goto f_forw_unkn;
 		} else {
 			logit(" %s:%s\n", f->f_un.f_forw.f_hname, f->f_un.f_forw.f_serv);
 			logit("Forwarding suspension not over, time left: %d.\n",
@@ -1641,7 +1590,11 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		break;
 
 	case F_FORW_UNKN:
-		/* nslookup retry handled by domark() timer */
+		logit("\n");
+	f_forw_unkn:
+		forw_lookup(f);
+		if (f->f_type == F_FORW)
+			goto f_forw;
 		break;
 
 	case F_FORW:
@@ -1654,7 +1607,7 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		msg.msg_iovlen = iovcnt;
 
 		for (int i = 0; i < iovcnt; i++) {
-			logit("iov[%d] => %s\n", i, (char *)iov[i].iov_base);
+//			logit("iov[%d] => %s\n", i, (char *)iov[i].iov_base);
 			len += iov[i].iov_len;
 		}
 
@@ -1710,6 +1663,10 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 			default:
 				f->f_type = F_FORW_SUSP;
 				ERR("INET sendto(%s:%s)", f->f_un.f_forw.f_hname, f->f_un.f_forw.f_serv);
+				if (f->f_un.f_forw.f_addr) {
+					freeaddrinfo(f->f_un.f_forw.f_addr);
+					f->f_un.f_forw.f_addr = NULL;
+				}
 			}
 		}
 		break;
@@ -1796,9 +1753,12 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		f->f_prevcount = 0;
 }
 
-#define fmtlogit(bm) logit("%s(%d, 0x%02x, %s, %s, %s, %s, %s, %s)", __func__, \
-			   bm->pri, bm->flags, bm->hostname, bm->app_name,     \
-			   bm->proc_id, bm->msgid, bm->sd, bm->msg)
+#define fmtlogit(bm) logit("%s(%d, 0x%02x, %s, %s, %s, %s, %s, %s)", __func__,		\
+			   bm->pri, bm->flags, bm->hostname ? bm->hostname : "-",	\
+			   bm->app_name ? bm->app_name : "-",				\
+			   bm->proc_id ? bm->proc_id : "-",				\
+			   bm->msgid ? bm->msgid : "-",					\
+			   bm->sd ? bm->sd : "-", bm->msg ? bm->msg : "-")
 
 static int fmt3164(struct buf_msg *buffer, char *fmt, struct iovec *iov, size_t iovmax)
 {
@@ -1898,7 +1858,7 @@ static void fprintlog_first(struct filed *f, struct buf_msg *buffer)
 	/* Messages generated by syslogd itself may not have a timestamp */
 	check_timestamp(buffer);
 
-	if (f->f_type != F_FORW_SUSP) {
+	if (f->f_type != F_FORW_SUSP && f->f_type != F_FORW_UNKN) {
 		f->f_time = timer_now();
 		f->f_prevcount = 0;
 	}
@@ -1910,7 +1870,7 @@ static void fprintlog_first(struct filed *f, struct buf_msg *buffer)
 	else
 		iovcnt = fmt3164(buffer, BSDFMT_DATEFMT, iov, NELEMS(iov));
 
-	logit("logging to %s", TypeNames[f->f_type]);
+	logit(" logging to %s", TypeNames[f->f_type]);
 	fprintlog_write(f, iov, iovcnt, buffer->flags);
 }
 
@@ -1949,7 +1909,6 @@ void endtty(int signo)
  */
 void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 {
-#ifdef HAVE_UTMP_H
 	static int reenter = 0;
 	struct utmp *uptr;
 	struct utmp  ut;
@@ -1970,7 +1929,7 @@ void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 	 * and doing notty().
 	 */
 	if (fork() == 0) {
-		time_t t_now = boot_time + timer_now();
+		time_t t_now = time(NULL);
 
 		(void)signal(SIGTERM, SIG_DFL);
 		(void)alarm(0);
@@ -2041,7 +2000,6 @@ void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 	/* close the user login file */
 	endutent();
 	reenter = 0;
-#endif
 }
 
 void reapchild(int signo)
@@ -2151,39 +2109,42 @@ void flog(int pri, char *fmt, ...)
 
 static void forw_lookup(struct filed *f)
 {
-	struct addrinfo *ai;
-	time_t diff;
 	char *host = f->f_un.f_forw.f_hname;
 	char *serv = f->f_un.f_forw.f_serv;
+	struct addrinfo *ai;
 	int err, first;
+	time_t diff;
 
-	/* Called from cfline() for firstial lookup? */
+	/* Called from cfline() for initial lookup? */
 	first = f->f_type == F_UNUSED ? 1 : 0;
 
+	/*
+	 * Not INET_SUSPEND_TIME, but back off a few seconds at least
+	 * to prevent syslogd from hammering the resolver for every
+	 * little message that is logged.  E.g., at boot when we read
+	 * the kernel ring buffer.
+	 */
 	diff = timer_now() - f->f_time;
-	if (!first && diff < INET_SUSPEND_TIME) {
-		logit("Forwarding suspension not over, time left: %d\n",
-		      (int)(INET_SUSPEND_TIME - diff));
+	if (!first && diff < 5)
 		return;
-	}
-
-	if (!first)
-		logit("Forwarding suspension to %s:%s over, retrying\n", host, serv);
 
 	err = nslookup(host, serv, &ai);
 	if (err) {
-		WARN("Failed resolving '%s:%s': %s", host, serv, gai_strerror(err));
 		f->f_type = F_FORW_UNKN;
 		f->f_time = timer_now();
+		if (!first && !(f->f_flags & SUSP_RETR))
+			WARN("Failed resolving '%s:%s': %s", host, serv, gai_strerror(err));
+		f->f_flags |= SUSP_RETR; /* Retry silently */
 		return;
 	}
 
-	if (!first)
-		NOTE("Successfully resolved '%s:%s', resuming operation.", host, serv);
-
+	f->f_flags &= ~SUSP_RETR;
 	f->f_type = F_FORW;
 	f->f_un.f_forw.f_addr = ai;
 	f->f_prevcount = 0;
+
+	if (!first)
+		NOTE("Successfully resolved '%s:%s', initiating forwarding.", host, serv);
 }
 
 void domark(void *arg)
@@ -2205,7 +2166,8 @@ void doflush(void *arg)
 	SIMPLEQ_FOREACH(f, &fhead, f_link) {
 		if (f->f_type == F_FORW_UNKN) {
 			forw_lookup(f);
-			continue;
+			if (f->f_type != F_FORW)
+				continue;
 		}
 
 		if (f->f_prevcount && timer_now() >= REPEATTIME(f)) {
@@ -2246,8 +2208,10 @@ static void close_open_log_files(void)
 			break;
 
 		case F_FORW:
-			if (f->f_un.f_forw.f_addr)
+			if (f->f_un.f_forw.f_addr) {
 				freeaddrinfo(f->f_un.f_forw.f_addr);
+				f->f_un.f_forw.f_addr = NULL;
+			}
 			break;
 		}
 
@@ -2292,7 +2256,6 @@ void die(int signo)
  */
 static int waitdaemon(int maxwait)
 {
-#ifdef HAVE_FORK
 	struct sigaction sa;
 	pid_t pid, childpid;
 	int status;
@@ -2341,7 +2304,6 @@ static int waitdaemon(int maxwait)
 		(void)close(fd);
 	}
 
-#endif /* HAVE_FORK */
 	return getppid();
 }
 
@@ -2409,16 +2371,10 @@ static void signal_init(void)
 
 	SIGNAL(SIGTERM, die);
 	SIGNAL(SIGINT,  Debug ? die : SIG_IGN);
-#ifdef SIGQUIT
 	SIGNAL(SIGQUIT, Debug ? die : SIG_IGN);
-#endif
 	SIGNAL(SIGUSR1, Debug ? debug_switch : SIG_IGN);
-#ifdef SIGXFSZ
 	SIGNAL(SIGXFSZ, SIG_IGN);
-#endif
-#ifdef SIGHUP
 	SIGNAL(SIGHUP,  reload);
-#endif
 	SIGNAL(SIGCHLD, reapchild);
 }
 
@@ -2431,13 +2387,6 @@ static void boot_time_init(void)
 	gettimeofday(&tv, NULL);
 	sysinfo(&si);
 	boot_time = tv.tv_sec - si.uptime;
-#else
-	struct timespec mts;
-	struct timespec rts;
-
-	clock_gettime(CLOCK_MONOTONIC, &mts);
-	clock_gettime(CLOCK_REALTIME, &rts);
-	boot_time = rts.tv_sec - mts.tv_sec;
 #endif
 }
 
