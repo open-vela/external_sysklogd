@@ -1,9 +1,9 @@
 #!/bin/sh
-set -ex
 if [ x"${srcdir}" = x ]; then
     srcdir=.
 fi
-. ${srcdir}/test.rc
+. ${srcdir}/lib.sh
+setup
 
 export MSG="no-openlog-apitest"
 
@@ -35,10 +35,9 @@ sleep 2
 ./api -i troglobit -p
 sleep 2
 ps fax |grep -A2 syslogd
-grep "troglobit - MSGID - ${MSG}" ${LOGV1} || (echo "== ${LOGV1}"; tail -10  ${LOGV1}; echo "== ${LOG}"; tail -10  ${LOG}; cat ${CONFD}/v1.conf; false)
+grep "troglobit - MSGID - ${MSG}" ${LOGV1} || (echo "== ${LOGV1}"; tail -10  ${LOGV1}; echo "== ${LOG}"; tail -10  ${LOG}; cat ${CONFD}/v1.conf; FAIL "Cannot find troglobit")
 
 echo "= Phase 4 - Verify RFC5424 API with logger(1) ==========="
 ../src/logger -p ftp.notice -u ${SOCK} -m "MSDSD" -d '[exampleSDID@32473 iut="3" eventSource="Application" eventID="1011"]' "waldo"
 sleep 2
-grep "exampleSDID@32473" ${LOGV1} || (echo "== ${LOGV1}"; tail -10  ${LOGV1}; false)
-
+grep "exampleSDID@32473" ${LOGV1} || (echo "== ${LOGV1}"; tail -10  ${LOGV1}; FAIL "Cannot find exampleSDID@32473")
