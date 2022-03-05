@@ -505,6 +505,7 @@ int main(int argc, char *argv[])
 	 */
 	if (KernLog) {
 		if (in_container()) {
+			KernLog = 0;
 			no_sys = 1;
 			goto no_klogd;
 		}
