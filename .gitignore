@@ -28,3 +28,6 @@ missing
 stamp-h1
 syslogd.service
 test-driver
+.built
+.depend
+Make.dep

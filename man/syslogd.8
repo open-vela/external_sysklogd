@@ -38,7 +38,7 @@
 .Nd log systems messages
 .Sh SYNOPSIS
 .Nm
-.Op Fl ?468AdFHKknsTtv
+.Op Fl ?46AdFknsTv
 .Op Fl a Ar addr[/len][:port]
 .Op Fl a Ar name[:port]
 .Op Fl b Ar addr[:port]
@@ -129,22 +129,6 @@ to use IPv4 addresses only.
 Force
 .Nm
 to use IPv6 addresses only.
-.It Fl 8
-Tells
-.Nm
-not to interfere with 8-bit data.  Normally
-.Nm
-replaces C1 control characters
-.Pq ISO 8859 and Unicode characters
-with their
-.Dq M- Ns Em x
-equivalent.  Note, this option does not change the way
-.Nm
-alters control characters
-.Pq see Xr iscntrl 3 .
-They are always replaced with their
-.Dq ^ Ns Em x
-equivalent.
 .It Fl A
 Ordinarily,
 .Nm
@@ -153,7 +137,7 @@ even if the host has more than one A or AAAA record.
 If this option is specified,
 .Nm
 tries to send the message to all addresses.
-.It Fl a Ar peer
+.It Fl a Ar address[/len][:service] | Fl a Ar domainname[:service]
 Allow peers to log to this syslogd using UDP datagrams.  Multiple
 .Fl a
 options may be specified.  Any
@@ -162,11 +146,9 @@ option is ignored if the
 .Fl s
 option is also specified.
 .Pp
-The
-.Ar peer
-argument may be any of the following:
+The peer argument may be any of the following:
 .Bl -tag -width 'address[/len][:service]'
-.It address[/len][:service]
+.It Ql address[/len][:service]
 Accept datagrams from IP
 .Ar address ,
 which can be specified as an IPv4 address or as an IPv6 address enclosed
@@ -193,7 +175,7 @@ otherwise.  If
 is an IPv6 address, a missing prefix
 .Ar len
 will be substituted by 128.
-.It domainname[:service]
+.It Ql domainname[:service]
 Accept datagrams where the reverse address lookup yields
 .Ar domainname
 for the sender address.  The meaning of
@@ -203,31 +185,31 @@ is as explained above.
 can contain special characters of a shell-style pattern such as
 .Ql * .
 .El
-.It Fl b Ar name
-Bind to a specific address and/or port.  By default,
-.Nm
-listens on all interfaces on UDP port 514, unless started with the
-.Fl s
-option.  Multiple
+.It Xo
 .Fl b
-options may be specified to bind to several addresses and/or ports.
-.Pp
-The
-.Ar name
-argument may be any of the following:
-.Bl -tag -width 'address[/len][:service]'
-.It address[:port]
-The address can be specified as a hostname or an IP address, and the
-port as a service name or port number.  If an IPv6 address is specified,
-it should be enclosed with
+.Sm off
+.Ar address Op \&: Ar service
+.Sm on
+.Xc
+.It Xo
+.Fl b
+.Sm off
+.Li \&: Ar service
+.Sm on
+.Xc
+Bind to a specific address and/or port.
+The address can be specified as a hostname,
+and the port as a service name.
+If an IPv6 address is specified, it should be enclosed with
 .Ql \&[
 and
 .Ql \&] .
-.It :port
-Service name or UDP port number.  The default service is
-.Ql syslog
-(UDP), port 512.
-.El
+The default
+.Ar service
+is
+.Ql syslog .
+This option can be specified multiple times to bind to
+multiple addresses and/or ports.
 .It Fl C Ar file
 File to use for caching last read kernel sequence number from
 .Pa /dev/kmsg ,
@@ -270,12 +252,6 @@ and
 to run
 .Nm ,
 and wants to monitor when and how it exits.
-.It Fl H
-When logging remote messages use hostname from the message (if supplied)
-instead of using address from which the message was received.
-.It Fl K
-Disable kernel logging.  Useful in container use-cases where kernel logs
-har handled by the host system.
 .It Fl k
 Disable the translation of
 messages received with facility
@@ -334,44 +310,11 @@ is 5.
 Operate in secure mode.  Do not log messages from remote machines.  If
 specified twice, no network socket will be opened at all, which also
 disables logging to remote machines.
-.Pp
-Secure mode can also be set in
-.Xr syslog.conf 5
-using the
-.Cm secure_mode
-config option.  This is more flexible since you can change the option
-and simply send
-.Ar SIGHUP
-to activate the changes, instead of having to restart
-.Nm .
-.Pp
-.Sy Note:
-the command line option always wins, so it must be removed for
-.Nm
-to consider the .conf file option instead.
 .It Fl T
 Always use the local time and date for messages received from the network,
 instead of the timestamp field supplied in the message by the remote host.
 This is useful if some of the originating hosts cannot keep time properly
 or are unable to generate a correct timestamp.
-.It Fl t
-Keep (trust) kernel timestamp.
-.Pp
-On Linux systems the
-.Pa /dev/kmsg
-timestamp is a monotonic clock, in microseconds, relative to the boot of
-the system.  This timestamp is, among other things,
-.Sy not
-adjusted for suspend/resume cycles, meaning the kernel logs can start to
-go out of sync with the rest of the system.  This in turn can make it
-really hard to correlate events.
-.Pp
-.Nm
-by default only trusts the kernel timestamp when starting up the first
-time.  As soon as the the kernel ring buffer has been emptied,
-.Nm
-uses its own current time for each received kernel log message.  This
-option disables that behavior.
 .It Fl v
 Show program version and exit.
 .El
@@ -498,10 +441,6 @@ SIGTERM.
 .It USR1
 In debug mode this switches debugging on/off.  In normal operation
 it is ignored.
-.It USR2
-.Nm
-will rotate all files for which rotation is configured when receiving
-this signal.
 .El
 .Pp
 For convenience the PID is by default stored in
