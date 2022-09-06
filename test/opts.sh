@@ -1,17 +1,21 @@
 #!/bin/sh
-# shellcheck disable=SC1090
+set -x
+
 if [ x"${srcdir}" = x ]; then
     srcdir=.
 fi
-. ${srcdir}/lib.sh
+. ${srcdir}/test.rc
 
-cat <<EOF > "${CONF}"
+mkdir -p ${CONFD}
+cat <<EOF > ${CONF}
 # Match all log messages, store in RC5424 format and rotate every 10 MiB
 *.*       -${LOG}    ;rotate=10M:5,RFC5424
 EOF
 
-setup -m0 >"${LOG2}"
+../src/syslogd -m1 -b :${PORT} -d -sF -f ${CONF} -p ${SOCK} -p ${ALTSOCK} >${LOG2} &
+echo "$!" > ${PID}
 
-grep ';RFC5424,rotate=10000000:5' "${LOG2}" || FAIL "Failed parsing RFC5424 .conf"
+sleep 1
+kill -9 ${PID}
 
-OK
+grep ';RFC5424,rotate=10000000:5' ${LOG2}
