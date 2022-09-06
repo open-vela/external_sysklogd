@@ -25,7 +25,7 @@
 # OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 # SUCH DAMAGE.
 
-AC_INIT([sysklogd], [2.4.4], [https://github.com/troglobit/sysklogd/issues],,
+AC_INIT([sysklogd], [2.3.0-beta1], [https://github.com/troglobit/sysklogd/issues],,
 	[https://github.com/troglobit/sysklogd])
 AC_CONFIG_AUX_DIR(aux)
 AM_INIT_AUTOMAKE([1.11 foreign subdir-objects])
@@ -53,6 +53,15 @@ PKG_PROG_PKG_CONFIG
 # Check for usually missing API's, which we can replace
 AC_REPLACE_FUNCS([pidfile strlcpy strlcat utimensat])
 AC_CONFIG_LIBOBJ_DIR([lib])
+
+# Check for utmp.h
+AC_CHECK_HEADERS([utmp.h])
+
+# Check for fork()
+AC_CHECK_FUNCS([fork])
+
+# Check for setsid()
+AC_CHECK_FUNCS([setsid])
 
 # Check for other library functions
 AC_CHECK_FUNCS([getprogname strtobytes])
