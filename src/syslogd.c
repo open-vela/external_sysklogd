@@ -1449,9 +1449,7 @@ static void logmsg(struct buf_msg *buffer)
 	prilev = LOG_PRI(buffer->pri);
 
 	sigemptyset(&mask);
-#ifdef SIGHUP
 	sigaddset(&mask, SIGHUP);
-#endif
 	sigaddset(&mask, SIGALRM);
 	sigprocmask(SIG_BLOCK, &mask, NULL);
 
@@ -2409,16 +2407,12 @@ static void signal_init(void)
 
 	SIGNAL(SIGTERM, die);
 	SIGNAL(SIGINT,  Debug ? die : SIG_IGN);
-#ifdef SIGQUIT
 	SIGNAL(SIGQUIT, Debug ? die : SIG_IGN);
-#endif
 	SIGNAL(SIGUSR1, Debug ? debug_switch : SIG_IGN);
 #ifdef SIGXFSZ
 	SIGNAL(SIGXFSZ, SIG_IGN);
 #endif
-#ifdef SIGHUP
 	SIGNAL(SIGHUP,  reload);
-#endif
 	SIGNAL(SIGCHLD, reapchild);
 }
 
