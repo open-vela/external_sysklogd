@@ -100,6 +100,8 @@ static char sccsid[] __attribute__((unused)) =
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #endif
 
+#define SecureMode (secure_opt > 0 ? secure_opt : secure_mode)
+
 char *CacheFile = _PATH_CACHE;
 char *ConfFile  = _PATH_LOGCONF;
 char *PidFile   = _PATH_LOGPID;
@@ -107,6 +109,9 @@ char  ctty[]    = _PATH_CONSOLE;
 
 static volatile sig_atomic_t debugging_on;
 static volatile sig_atomic_t restart;
+static volatile sig_atomic_t rotate_signal;
+
+static const char version_info[] = PACKAGE_NAME " v" PACKAGE_VERSION;
 
 /*
  * Intervals at which we flush out "message repeated" messages,
@@ -129,6 +134,7 @@ static int	  Debug;		/* debug flag */
 static int	  Foreground = 0;	/* don't fork - don't run in daemon mode */
 static time_t	  boot_time;		/* Offset for printsys() */
 static uint64_t	  sys_seqno = 0;	/* Last seen kernel log message */
+static int	  sys_seqno_init;	/* Timestamp can be in the past, use 'now' after first read */
 static int	  resolve = 1;		/* resolve hostname */
 static char	  LocalHostName[MAXHOSTNAMELEN + 1]; /* our hostname */
 static char	 *LocalDomain;			     /* our local domain name */
@@ -138,15 +144,23 @@ static int	  MarkInterval = 20 * 60; /* interval between marks in seconds */
 static int	  family = PF_UNSPEC;	  /* protocol family (IPv4, IPv6 or both) */
 static int	  mask_C1 = 1;		  /* mask characters from 0x80 - 0x9F */
 static int	  send_to_all;		  /* send message to all IPv4/IPv6 addresses */
-static int	  SecureMode;		  /* when true, receive only unix domain socks */
+static int	  secure_opt;		  /* sink for others, log to remote, or only unix domain socks */
+static int	  secure_mode;		  /* same as above but from syslog.conf, only if cmdline unset */
 
 static int	  RemoteAddDate;	  /* Always set the date on remote messages */
 static int	  RemoteHostname;	  /* Log remote hostname from the message */
 
+static int	  KernLog = 1;		  /* Track kernel logs by default */
 static int	  KeepKernFac;		  /* Keep remotely logged kernel facility */
+static int	  KeepKernTime;		  /* Keep kernel timestamp, evern after initial read */
 
 static off_t	  RotateSz = 0;		  /* Max file size (bytes) before rotating, disabled by default */
 static int	  RotateCnt = 5;	  /* Max number (count) of log files to keep, set with -c <NUM> */
+
+/*
+ * List of notifiers
+ */
+static SIMPLEQ_HEAD(notifiers, notifier) nothead = SIMPLEQ_HEAD_INITIALIZER(nothead);
 
 /*
  * List of peers and sockets for binding.
@@ -158,6 +172,21 @@ static SIMPLEQ_HEAD(, peer) pqueue = SIMPLEQ_HEAD_INITIALIZER(pqueue);
  */
 static SIMPLEQ_HEAD(, allowedpeer) aphead = SIMPLEQ_HEAD_INITIALIZER(aphead);
 
+/*
+ * central list of recognized configuration keywords with an optional
+ * address for their values as strings.  If there is no value ptr, the
+ * parser moves the argument to the beginning of the parsed line.
+ */
+char *secure_str;			  /* string value of secure_mode */
+
+const struct cfkey {
+	const char  *key;
+	char       **var;
+} cfkey[] = {
+	{ "notify",      NULL        },
+	{ "secure_mode", &secure_str },
+};
+
 /* Function prototypes. */
 static int  allowaddr(char *s);
 void        untty(void);
@@ -165,6 +194,9 @@ static void parsemsg(const char *from, char *msg);
 static int  opensys(const char *file);
 static void printsys(char *msg);
 static void logmsg(struct buf_msg *buffer);
+static void logrotate(struct filed *f);
+static void rotate_file(struct filed *f, struct stat *stp_or_null);
+static void rotate_all_files(void);
 static void fprintlog_first(struct filed *f, struct buf_msg *buffer);
 static void fprintlog_successive(struct filed *f, int flags);
 void        endtty();
@@ -172,6 +204,7 @@ void        wallmsg(struct filed *f, struct iovec *iov, int iovcnt);
 void        reapchild();
 const char *cvtaddr(struct sockaddr_storage *f, int len);
 const char *cvthname(struct sockaddr *f, socklen_t len);
+static void forw_lookup(struct filed *f);
 void        domark(void *arg);
 void        doflush(void *arg);
 void        debug_switch();
@@ -180,14 +213,52 @@ static void signal_init(void);
 static void boot_time_init(void);
 static void init(void);
 static int  strtobytes(char *arg);
-static int  cfparse(FILE *fp, struct files *newf);
+static int  cfparse(FILE *fp, struct files *newf, struct notifiers *newn);
 int         decode(char *name, struct _code *codetab);
 static void logit(char *, ...);
+static void notifier_add(struct notifiers *newn, const char *program);
+static void notifier_invoke(const char *logfile);
+static void notifier_free_all(void);
 void        reload(int);
+static void signal_rotate(int sig);
 static int  validate(struct sockaddr *sa, const char *hname);
-static int	waitdaemon(int);
-static void	timedout(int);
+static int  waitdaemon(int);
+static void timedout(int);
 
+
+/*
+ * Very basic, and incomplete, check if we're running in a container.
+ * If so, we probably want to disable kernel logging.
+ */
+static int in_container(void)
+{
+	const char *files[] = {
+		"/run/.containerenv",
+		"/.dockerenv"
+	};
+	const char *containers[] = {
+		"lxc",
+		"docker",
+		"kubepod"
+	};
+	size_t i;
+	char *c;
+
+	c = getenv("container");
+	if (c) {
+		for (i = 0; i < NELEMS(containers); i++) {
+			if (!strcmp(containers[i], c))
+				return 1;
+		}
+	}
+
+	for (i = 0; i < NELEMS(files); i++) {
+		if (!access(files[i], F_OK))
+			return 1;
+	}
+
+	return 0;
+}
 
 static int addpeer(struct peer *pe0)
 {
@@ -228,6 +299,7 @@ static void sys_seqno_load(void)
 			break; /* str began with a number but has junk left over at the end */
 
 		sys_seqno = val;
+		sys_seqno_init = 1; /* Ignore sys timestamp from now */
 	}
 	fclose(fp);
 }
@@ -248,16 +320,19 @@ static void sys_seqno_save(void)
 	fclose(fp);
 
 	prev = sys_seqno;
+
+	sys_seqno_init = 1;	/* Ignore sys timestamp from now */
 }
 
 int usage(int code)
 {
 	printf("Usage:\n"
-	       "  syslogd [-46AdFknsTv?] [-a PEER] [-b NAME] [-f FILE] [-m INTERVAL]\n"
-	       "                         [-P PID_FILE] [-p SOCK_PATH] [-r SIZE[:NUM]]\n"
+	       "  syslogd [-468AdFHKknsTtv?] [-a PEER] [-b NAME] [-f FILE] [-m INTERVAL]\n"
+	       "                             [-P PID_FILE] [-p SOCK_PATH] [-r SIZE[:NUM]]\n"
 	       "Options:\n"
 	       "  -4        Force IPv4 only\n"
 	       "  -6        Force IPv6 only\n"
+	       "  -8        Allow all 8-bit data, e.g. unicode, does not affect control chars\n"
 	       "  -A        Send to all addresses in DNS A, or AAAA record\n"
 	       "  -a PEER   Allow PEER to use us as a remote syslog sink. Ignored when started\n"
 	       "            with -s. Multiple -a options may be specified:\n"
@@ -283,6 +358,8 @@ int usage(int code)
 	       "  -d        Enable debug mode, implicitly enables -F to prevent backgrounding\n"
 	       "  -F        Run in foreground, required when monitored by init(1)\n"
 	       "  -f FILE   Alternate .conf file, default: %s\n"
+	       "  -H        Use hostname from message instead of address for remote messages\n"
+	       "  -K        Disable kernel logging, useful in container use-cases\n"
 	       "  -k        Allow logging with facility 'kernel', otherwise remapped to 'user'\n"
 	       "  -m MINS   Interval between MARK messages, 0 to disable, default: 20 min\n"
 	       "  -n        Disable DNS query for every request\n"
@@ -295,6 +372,7 @@ int usage(int code)
 	       "  -s        Operate in secure mode, do not log messages from remote machines.\n"
 	       "            If specified twice, no socket at all will be opened, which also\n"
 	       "            disables support for logging to remote machines.\n"
+	       "  -t        Keep kernel timestamp, even after initial ring buffer emptying\n"
 	       "  -T        Use local time and date for messages received from remote hosts\n"
 	       "  -?        Show this help text\n"
 	       "  -v        Show program version and exit\n"
@@ -311,11 +389,13 @@ int usage(int code)
 int main(int argc, char *argv[])
 {
 	pid_t ppid = 1;
+	int no_sys = 0;
+	int pflag = 0;
+	int bflag = 0;
 	char *ptr;
-	int pflag = 0, bflag = 0;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "46Aa:b:C:dHFf:km:nP:p:r:sTv?")) != EOF) {
+	while ((ch = getopt(argc, argv, "468Aa:b:C:dHFf:Kkm:nP:p:r:sTtv?")) != EOF) {
 		switch ((char)ch) {
 		case '4':
 			family = PF_INET;
@@ -323,6 +403,10 @@ int main(int argc, char *argv[])
 
 		case '6':
 			family = PF_INET6;
+			break;
+
+		case '8':
+			mask_C1 = 0;
 			break;
 
 		case 'A':
@@ -366,6 +450,10 @@ int main(int argc, char *argv[])
 			RemoteHostname = 1;
 			break;
 
+		case 'K':
+			KernLog = 0;
+			break;
+
 		case 'k':		/* keep remote kern fac */
 			KeepKernFac = 1;
 			break;
@@ -390,9 +478,9 @@ int main(int argc, char *argv[])
 
 			pflag = 1;
 			addpeer(&(struct peer) {
-					.pe_name = optarg,
-					.pe_mode = 0666,
-				});
+				.pe_name = optarg,
+				.pe_mode = 0666,
+			});
 			break;
 
 		case 'r':
@@ -400,16 +488,20 @@ int main(int argc, char *argv[])
 			break;
 
 		case 's':
-			SecureMode++;
+			secure_opt++;
 			break;
 
 		case 'T':
 			RemoteAddDate = 1;
 			break;
 
+		case 't':	/* keep/trust kernel timestamp always */
+			KeepKernTime = 1;
+			break;
+
 		case 'v':
-			printf("syslogd v%s\n", VERSION);
-			exit(0);
+			printf("%s\n", version_info);
+			return 0;
 
 		case '?':
 			return usage(0);
@@ -450,15 +542,24 @@ int main(int argc, char *argv[])
 	 * /dev/kmsg and fall back to _PROC_KLOG, which on GLIBC
 	 * systems is /proc/kmsg, and /dev/klog on *BSD.
 	 */
-	sys_seqno_load();
-	if (opensys("/dev/kmsg")) {
-		if (opensys(_PATH_KLOG))
-			warn("Kernel logging disabled, failed opening %s", _PATH_KLOG);
-		else
-			kern_console_off();
-	} else
-		kern_console_off();
+	if (KernLog) {
+		if (in_container()) {
+			KernLog = 0;
+			no_sys = 1;
+			goto no_klogd;
+		}
 
+		sys_seqno_load();
+		if (opensys("/dev/kmsg")) {
+			if (opensys(_PATH_KLOG))
+				warn("Kernel logging disabled, failed opening %s",
+				     _PATH_KLOG);
+			else
+				kern_console_off();
+		} else
+			kern_console_off();
+	}
+no_klogd:
 	consfile.f_type = F_CONSOLE;
 	strlcpy(consfile.f_un.f_fname, ctty, sizeof(consfile.f_un.f_fname));
 
@@ -491,11 +592,15 @@ int main(int argc, char *argv[])
 	 * Tell system we're up and running by creating /run/syslogd.pid
 	 */
 	if (pidfile(PidFile))
-		logit("Failed creating %s: %s", PidFile, strerror(errno));
+		logit("Failed creating %s: %s\n", PidFile, strerror(errno));
 
 	/* Tell parent we're up and running */
 	if (ppid != 1)
 		kill(ppid, SIGALRM);
+
+	/* Log if we disabled klogd */
+	if (no_sys)
+		NOTE("Running in a container, disabling klogd.");
 
 	/* Main loop begins here. */
 	for (;;) {
@@ -513,10 +618,17 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
+		if (rotate_signal > 0) {
+			rotate_signal = 0;
+			logit("\nReceived SIGUSR2, forcing log rotation.\n");
+			rotate_all_files();
+		}
+
 		if (rc < 0 && errno != EINTR)
 			ERR("select()");
 
-		sys_seqno_save();
+		if (KernLog)
+			sys_seqno_save();
 	}
 }
 
@@ -577,7 +689,18 @@ static void kernel_cb(int fd, void *arg)
 
 static int opensys(const char *file)
 {
+	struct stat st;
 	int fd;
+
+	/*
+	 * In some (container) use-cases /dev/kmsg might not be a proper
+	 * FIFO, which may lead to CPU overload and possible loss of
+	 * function.  This check, along with the in_container() function
+	 * is an attempt to remedy such scenarios.  It's merely a sanity
+	 * check, so ignore any TOCTOU warnings this might cause.
+	 */
+	if (stat(file, &st) || !S_ISCHR(st.st_mode))
+		return 1;
 
 	fd = open(file, O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
 	if (fd < 0)
@@ -613,6 +736,9 @@ static void create_unix_socket(struct peer *pe)
 	struct sockaddr_un sun;
 	struct addrinfo ai;
 	int sd = -1;
+
+	if (pe->pe_socknum)
+		return;		/* Already set up */
 
 	memset(&ai, 0, sizeof(ai));
 	ai.ai_addr = (struct sockaddr *)&sun;
@@ -694,6 +820,9 @@ static int nslookup(const char *host, const char *service, struct addrinfo **ai)
 	if (!node || !node[0])
 		node = NULL;
 
+	/* Reset resolver cache and retry name lookup */
+	res_init();
+
 	logit("nslookup '%s:%s'\n", node ?: "none", service);
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_flags    = !node ? AI_PASSIVE : 0;
@@ -705,31 +834,34 @@ static int nslookup(const char *host, const char *service, struct addrinfo **ai)
 
 static void create_inet_socket(struct peer *pe)
 {
-	struct addrinfo *res, *r;
+	struct addrinfo *ai, *res;
 	int sd, err;
 
 	err = nslookup(pe->pe_name, pe->pe_serv, &res);
 	if (err) {
-		ERRX("%s/udp service unknown: %s", pe->pe_serv, gai_strerror(err));
+		ERRX("%s/udp service unknown: %s", pe->pe_serv,
+		     gai_strerror(err));
 		return;
 	}
 
-	for (r = res; r; r = r->ai_next) {
+	for (ai = res; ai; ai = ai->ai_next) {
 		if (pe->pe_socknum + 1 >= NELEMS(pe->pe_sock)) {
-			WARN("Only %zd IP addresses per socket supported.", NELEMS(pe->pe_sock));
+			WARN("Only %zd IP addresses per socket supported.",
+			     NELEMS(pe->pe_sock));
 			break;
 		}
 
 		if (SecureMode)
-			r->ai_flags |= AI_SECURE;
+			ai->ai_flags |= AI_SECURE;
 		else
-			r->ai_flags &= ~AI_SECURE;
+			ai->ai_flags &= ~AI_SECURE;
 
-		sd = socket_create(r, inet_cb, NULL);
+		sd = socket_create(ai, inet_cb, NULL);
 		if (sd < 0)
 			continue;
 
-		logit("Created inet socket %d for %s:%s ...\n", sd, pe->pe_name, pe->pe_serv);
+		logit("Created inet socket %d for %s:%s ...\n", sd,
+		      pe->pe_name, pe->pe_serv);
 		pe->pe_sock[pe->pe_socknum++] = sd;
 	}
 
@@ -1015,7 +1147,7 @@ bad:
 static void
 parsemsg_rfc3164(const char *from, int pri, char *msg)
 {
-	struct logtime timestamp_remote;
+	struct logtime timestamp_remote = { 0 };
 	struct buf_msg buffer;
 	struct tm tm_parsed;
 	size_t i, msglen;
@@ -1033,12 +1165,19 @@ parsemsg_rfc3164(const char *from, int pri, char *msg)
 	 */
 	if (strptime(msg, RFC3164_DATEFMT, &tm_parsed) ==
 	    msg + RFC3164_DATELEN && msg[RFC3164_DATELEN] == ' ') {
+
 		msg += RFC3164_DATELEN + 1;
 
 		if (!RemoteAddDate) {
+			struct timeval tv;
+			time_t t_remote;
 			struct tm tm_now;
-			time_t t_now;
 			int year;
+
+			if (gettimeofday(&tv, NULL) == -1) {
+				tv.tv_sec  = time(NULL);
+				tv.tv_usec = 0;
+			}
 
 			/*
 			 * As the timestamp does not contain the year
@@ -1052,19 +1191,20 @@ parsemsg_rfc3164(const char *from, int pri, char *msg)
 			 * This loop can only run for at most three
 			 * iterations before terminating.
 			 */
-			t_now = boot_time + timer_now();
-			localtime_r(&t_now, &tm_now);
+			localtime_r(&tv.tv_sec, &tm_now);
 			for (year = tm_now.tm_year + 1;; --year) {
-				assert(year >= tm_now.tm_year - 1);
+				if (year < tm_now.tm_year - 1)
+					break;
 				timestamp_remote.tm = tm_parsed;
 				timestamp_remote.tm.tm_year = year;
 				timestamp_remote.tm.tm_isdst = -1;
-				timestamp_remote.usec = 0;
-				if (mktime(&timestamp_remote.tm) <
-				    t_now + 7 * 24 * 60 * 60)
+				t_remote = mktime(&timestamp_remote.tm);
+				if ((t_remote != (time_t)-1) &&
+				    (t_remote - tv.tv_sec) < 7 * 24 * 60 * 60)
 					break;
 			}
 			buffer.timestamp = timestamp_remote;
+			buffer.timestamp.usec = tv.tv_usec;
 		}
 	}
 
@@ -1188,21 +1328,22 @@ void printsys(char *msg)
 
 		if (*p == '<') {
 			/* /proc/klog or *BSD /dev/klog */
+			p++;
 			buffer.pri = 0;
-			while (isdigit(*++p))
-				buffer.pri = 10 * buffer.pri + (*p - '0');
+			while (isdigit(*p))
+				buffer.pri = 10 * buffer.pri + (*p++ - '0');
 			if (*p == '>')
-				++p;
+				p++;
 		} else if (isdigit(*p)) {
 			/* Linux /dev/kmsg: "pri,seq#,msec,flag[,..];msg" */
-			time_t now = boot_time;
+			time_t now;
 
 			/* pri */
 			buffer.pri = 0;
 			while (isdigit(*p))
 				buffer.pri = 10 * buffer.pri + (*p++ - '0');
-
-			p++;	      /* skip ',' */
+			if (*p == ',')
+				p++;
 
 			/* seq# */
 			while (isdigit(*p))
@@ -1218,15 +1359,42 @@ void printsys(char *msg)
 					return;
 			}
 			sys_seqno = seqno;
-
-			p++;	      /* skip ',' */
+			if (*p == ',')
+				p++;
 
 			/* timestamp */
 			while (isdigit(*p))
 				ustime = 10 * ustime + (*p++ - '0');
-			now += ustime / 1000000;
-			buffer.timestamp.usec = ustime % 1000000;
+
+			/*
+			 * When syslogd starts up, we assume this happens at
+			 * close to system boot, we read all kernel logs from
+			 * /dev/kmsg (Linux) and calculate the precise time
+			 * stamp using boot_time + usec to get the time of a
+			 * log entry.  However, since the kernel time stamp
+			 * is not adjusted for suspend/resume it can be many
+			 * days (!) off after a few weeks of uptime.  It has
+			 * turned out to be quite an interesting problem to
+			 * compensate for, so at runtime we instead use the
+			 * current time of any new kernel messages.
+			 *     -- Joachim Wiberg Nov 23, 2021
+			 */
+			if (KeepKernTime || !sys_seqno_init) {
+				now = boot_time + ustime / 1000000;
+				localtime_r(&now, &buffer.timestamp.tm);
+			} else {
+				struct timeval tv;
+
+				now = time(NULL);
+				if (gettimeofday(&tv, NULL) == -1) {
+					tv.tv_sec  = time(NULL);
+					tv.tv_usec = 0;
+				}
+				ustime = tv.tv_usec * 1000000;
+			}
+
 			localtime_r(&now, &buffer.timestamp.tm);
+			buffer.timestamp.usec = ustime % 1000000;
 
 			/* skip flags for now */
 			q = strchr(p, ';');
@@ -1361,18 +1529,8 @@ void printsys(char *msg)
 		}
 
 		q = lp;
-		while (*p != '\0' && (c = *p++) != '\n' && q < &line[MAXLINE]) {
-			/* Linux /dev/kmsg C-style hex encoding. */
-			if (c == '\\' && *p == 'x') {
-				char code[5] = "0x\0\0\0";
-
-				p++;
-				code[2] = *p++;
-				code[3] = *p++;
-				c = (int)strtol(code, NULL, 16);
-			}
+		while (*p != '\0' && (c = *p++) != '\n' && q < &line[MAXLINE])
 			*q++ = c;
-		}
 		*q = '\0';
 
 		logmsg(&buffer);
@@ -1407,8 +1565,10 @@ static void check_timestamp(struct buf_msg *buffer)
 	if (memcmp(&buffer->timestamp, &zero, sizeof(zero)))
 		return;
 
-	if (gettimeofday(&tv, NULL) == -1)
-		return;
+	if (gettimeofday(&tv, NULL) == -1) {
+		tv.tv_sec  = time(NULL);
+		tv.tv_usec = 0;
+	}
 
 	localtime_r(&tv.tv_sec, &now.tm);
 	now.usec = tv.tv_usec;
@@ -1430,8 +1590,13 @@ static void logmsg(struct buf_msg *buffer)
 	int fac, prilev;
 
 	logit("logmsg: %s, flags %x, from %s, app-name %s procid %s msgid %s sd %s msg %s\n",
-	      textpri(buffer->pri), buffer->flags, buffer->hostname, buffer->app_name,
-	      buffer->proc_id, buffer->msgid, buffer->sd, buffer->msg);
+	      textpri(buffer->pri), buffer->flags,
+	      buffer->hostname ? buffer->hostname : "nil",
+	      buffer->app_name ? buffer->app_name : "nil",
+	      buffer->proc_id  ? buffer->proc_id  : "nil",
+	      buffer->msgid    ? buffer->msgid    : "nil",
+	      buffer->sd       ? buffer->sd       : "nil",
+	      buffer->msg);
 
 	/* Messages generated by syslogd itself may not have a timestamp */
 	check_timestamp(buffer);
@@ -1542,7 +1707,7 @@ static void logmsg(struct buf_msg *buffer)
 	sigprocmask(SIG_UNBLOCK, &mask, NULL);
 }
 
-void logrotate(struct filed *f)
+static void logrotate(struct filed *f)
 {
 	struct stat statf;
 
@@ -1553,49 +1718,76 @@ void logrotate(struct filed *f)
 		return;
 
 	/* bug (mostly harmless): can wrap around if file > 4gb */
-	if (S_ISREG(statf.st_mode) && statf.st_size > f->f_rotatesz) {
-		if (f->f_rotatecount > 0) { /* always 0..999 */
-			int  len = strlen(f->f_un.f_fname) + 10 + 5;
-			int  i;
-			char oldFile[len];
-			char newFile[len];
+	if (S_ISREG(statf.st_mode) && statf.st_size > f->f_rotatesz)
+		rotate_file(f, &statf);
+}
 
-			/* First age zipped log files */
-			for (i = f->f_rotatecount; i > 1; i--) {
-				snprintf(oldFile, len, "%s.%d.gz", f->f_un.f_fname, i - 1);
-				snprintf(newFile, len, "%s.%d.gz", f->f_un.f_fname, i);
+static void rotate_file(struct filed *f, struct stat *stp_or_null)
+{
+	if (f->f_rotatecount > 0) { /* always 0..999 */
+		struct stat st_stack;
+		int  len = strlen(f->f_un.f_fname) + 10 + 5;
+		int  i;
+		char oldFile[len];
+		char newFile[len];
 
-				/* ignore errors - file might be missing */
-				(void)rename(oldFile, newFile);
-			}
+		/* First age zipped log files */
+		for (i = f->f_rotatecount; i > 1; i--) {
+			snprintf(oldFile, len, "%s.%d.gz", f->f_un.f_fname, i - 1);
+			snprintf(newFile, len, "%s.%d.gz", f->f_un.f_fname, i);
 
-			/* rename: f.8 -> f.9; f.7 -> f.8; ... */
-			for (i = 1; i > 0; i--) {
-				snprintf(oldFile, len, "%s.%d", f->f_un.f_fname, i - 1);
-				snprintf(newFile, len, "%s.%d", f->f_un.f_fname, i);
+			/* ignore errors - file might be missing */
+			(void)rename(oldFile, newFile);
+		}
 
-				if (!rename(oldFile, newFile) && i > 0) {
-					size_t clen = 18 + strlen(newFile) + 1;
-					char cmd[clen];
+		/* rename: f.8 -> f.9; f.7 -> f.8; ... */
+		for (i = 1; i > 0; i--) {
+			snprintf(oldFile, len, "%s.%d", f->f_un.f_fname, i - 1);
+			snprintf(newFile, len, "%s.%d", f->f_un.f_fname, i);
 
-					snprintf(cmd, sizeof(cmd), "gzip -f %s", newFile);
-					system(cmd);
-				}
-			}
+			if (!rename(oldFile, newFile) && i > 0) {
+				size_t clen = 18 + strlen(newFile) + 1;
+				char cmd[clen];
 
-			/* newFile == "f.0" now */
-			snprintf(newFile, len, "%s.0", f->f_un.f_fname);
-			(void)rename(f->f_un.f_fname, newFile);
-			close(f->f_file);
-
-			f->f_file = open(f->f_un.f_fname, O_CREATE | O_NONBLOCK | O_NOCTTY, 0644);
-			if (f->f_file < 0) {
-				f->f_type = F_UNUSED;
-				ERR("Failed re-opening log file %s after rotation", f->f_un.f_fname);
-				return;
+				snprintf(cmd, sizeof(cmd), "gzip -f %s", newFile);
+				system(cmd);
 			}
 		}
-		ftruncate(f->f_file, 0);
+
+		/* newFile == "f.0" now */
+		snprintf(newFile, len, "%s.0", f->f_un.f_fname);
+		(void)rename(f->f_un.f_fname, newFile);
+
+		/* Get mode of open descriptor if not yet */
+		if (stp_or_null == NULL) {
+			stp_or_null = &st_stack;
+			if (fstat(f->f_file, stp_or_null))
+				stp_or_null = NULL;
+		}
+
+		close(f->f_file);
+
+		f->f_file = open(f->f_un.f_fname, O_CREATE | O_NONBLOCK | O_NOCTTY,
+				 (stp_or_null ? stp_or_null->st_mode : 0644));
+		if (f->f_file < 0) {
+			f->f_type = F_UNUSED;
+			ERR("Failed re-opening log file %s after rotation", f->f_un.f_fname);
+			return;
+		}
+
+		if (!SIMPLEQ_EMPTY(&nothead))
+			notifier_invoke(f->f_un.f_fname);
+	}
+	ftruncate(f->f_file, 0);
+}
+
+static void rotate_all_files(void)
+{
+	struct filed *f;
+
+	SIMPLEQ_FOREACH(f, &fhead, f_link) {
+		if (f->f_type == F_FILE && f->f_rotatesz)
+			rotate_file(f, NULL);
 	}
 }
 
@@ -1629,8 +1821,8 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		fwd_suspend = timer_now() - f->f_time;
 		if (fwd_suspend >= INET_SUSPEND_TIME) {
 			logit("\nForwarding suspension over, retrying FORW ");
-			f->f_type = F_FORW;
-			goto f_forw;
+			f->f_type = F_FORW_UNKN;
+			goto f_forw_unkn;
 		} else {
 			logit(" %s:%s\n", f->f_un.f_forw.f_hname, f->f_un.f_forw.f_serv);
 			logit("Forwarding suspension not over, time left: %d.\n",
@@ -1639,7 +1831,11 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		break;
 
 	case F_FORW_UNKN:
-		/* nslookup retry handled by domark() timer */
+		logit("\n");
+	f_forw_unkn:
+		forw_lookup(f);
+		if (f->f_type == F_FORW)
+			goto f_forw;
 		break;
 
 	case F_FORW:
@@ -1652,7 +1848,7 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		msg.msg_iovlen = iovcnt;
 
 		for (int i = 0; i < iovcnt; i++) {
-			logit("iov[%d] => %s\n", i, (char *)iov[i].iov_base);
+//			logit("iov[%d] => %s\n", i, (char *)iov[i].iov_base);
 			len += iov[i].iov_len;
 		}
 
@@ -1708,6 +1904,10 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 			default:
 				f->f_type = F_FORW_SUSP;
 				ERR("INET sendto(%s:%s)", f->f_un.f_forw.f_hname, f->f_un.f_forw.f_serv);
+				if (f->f_un.f_forw.f_addr) {
+					freeaddrinfo(f->f_un.f_forw.f_addr);
+					f->f_un.f_forw.f_addr = NULL;
+				}
 			}
 		}
 		break;
@@ -1786,7 +1986,7 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		f->f_time = timer_now();
 		logit("\n");
 		pushiov(iov, iovcnt, "\r\n");
-		wallmsg(f, &iov[1], iovcnt - 1);
+		wallmsg(f, &iov[0], iovcnt);
 		break;
 	} /* switch */
 
@@ -1794,9 +1994,12 @@ void fprintlog_write(struct filed *f, struct iovec *iov, int iovcnt, int flags)
 		f->f_prevcount = 0;
 }
 
-#define fmtlogit(bm) logit("%s(%d, 0x%02x, %s, %s, %s, %s, %s, %s)", __func__, \
-			   bm->pri, bm->flags, bm->hostname, bm->app_name,     \
-			   bm->proc_id, bm->msgid, bm->sd, bm->msg)
+#define fmtlogit(bm) logit("%s(%d, 0x%02x, %s, %s, %s, %s, %s, %s)", __func__,		\
+			   bm->pri, bm->flags, bm->hostname ? bm->hostname : "-",	\
+			   bm->app_name ? bm->app_name : "-",				\
+			   bm->proc_id ? bm->proc_id : "-",				\
+			   bm->msgid ? bm->msgid : "-",					\
+			   bm->sd ? bm->sd : "-", bm->msg ? bm->msg : "-")
 
 static int fmt3164(struct buf_msg *buffer, char *fmt, struct iovec *iov, size_t iovmax)
 {
@@ -1822,7 +2025,15 @@ static int fmt3164(struct buf_msg *buffer, char *fmt, struct iovec *iov, size_t 
 	}
 
 	if (buffer->app_name) {
-		pushiov(iov, i, buffer->app_name);
+		/*
+		 * RFC3164, sec 4.1.3: "The TAG is a string of ABNF
+		 * alphanumeric characters that MUST NOT exceed 32
+		 * characters."
+		 */
+		iov[i].iov_base = buffer->app_name;
+		iov[i].iov_len  = MIN(strlen(buffer->app_name), 32);
+		i++;
+
 		if (buffer->proc_id) {
 			pushiov(iov, i, "[");
 			pushiov(iov, i, buffer->proc_id);
@@ -1896,7 +2107,7 @@ static void fprintlog_first(struct filed *f, struct buf_msg *buffer)
 	/* Messages generated by syslogd itself may not have a timestamp */
 	check_timestamp(buffer);
 
-	if (f->f_type != F_FORW_SUSP) {
+	if (f->f_type != F_FORW_SUSP && f->f_type != F_FORW_UNKN) {
 		f->f_time = timer_now();
 		f->f_prevcount = 0;
 	}
@@ -1908,7 +2119,7 @@ static void fprintlog_first(struct filed *f, struct buf_msg *buffer)
 	else
 		iovcnt = fmt3164(buffer, BSDFMT_DATEFMT, iov, NELEMS(iov));
 
-	logit("logging to %s", TypeNames[f->f_type]);
+	logit(" logging to %s", TypeNames[f->f_type]);
 	fprintlog_write(f, iov, iovcnt, buffer->flags);
 }
 
@@ -1968,7 +2179,7 @@ void wallmsg(struct filed *f, struct iovec *iov, int iovcnt)
 	 * and doing notty().
 	 */
 	if (fork() == 0) {
-		time_t t_now = boot_time + timer_now();
+		time_t t_now = time(NULL);
 
 		(void)signal(SIGTERM, SIG_DFL);
 		(void)alarm(0);
@@ -2149,39 +2360,50 @@ void flog(int pri, char *fmt, ...)
 
 static void forw_lookup(struct filed *f)
 {
-	struct addrinfo *ai;
-	time_t diff;
 	char *host = f->f_un.f_forw.f_hname;
 	char *serv = f->f_un.f_forw.f_serv;
+	struct addrinfo *ai;
 	int err, first;
+	time_t diff;
 
-	/* Called from cfline() for firstial lookup? */
-	first = f->f_type == F_UNUSED ? 1 : 0;
-
-	diff = timer_now() - f->f_time;
-	if (!first && diff < INET_SUSPEND_TIME) {
-		logit("Forwarding suspension not over, time left: %d\n",
-		      (int)(INET_SUSPEND_TIME - diff));
+	if (SecureMode > 1) {
+		if (f->f_un.f_forw.f_addr)
+			freeaddrinfo(f->f_un.f_forw.f_addr);
+		f->f_un.f_forw.f_addr = NULL;
+		f->f_type = F_FORW_UNKN;
 		return;
 	}
 
-	if (!first)
-		logit("Forwarding suspension to %s:%s over, retrying\n", host, serv);
+	/* Called from cfline() for initial lookup? */
+	first = f->f_type == F_UNUSED ? 1 : 0;
+
+	/*
+	 * Not INET_SUSPEND_TIME, but back off a few seconds at least
+	 * to prevent syslogd from hammering the resolver for every
+	 * little message that is logged.  E.g., at boot when we read
+	 * the kernel ring buffer.
+	 */
+	diff = timer_now() - f->f_time;
+	if (!first && diff < 5)
+		return;
 
 	err = nslookup(host, serv, &ai);
 	if (err) {
-		WARN("Failed resolving '%s:%s': %s", host, serv, gai_strerror(err));
 		f->f_type = F_FORW_UNKN;
 		f->f_time = timer_now();
+		if (!first && !(f->f_flags & SUSP_RETR))
+			WARN("Failed resolving '%s:%s': %s", host, serv, gai_strerror(err));
+		f->f_flags |= SUSP_RETR; /* Retry silently */
 		return;
 	}
 
-	if (!first)
-		NOTE("Successfully resolved '%s:%s', resuming operation.", host, serv);
-
+	f->f_flags &= ~SUSP_RETR;
 	f->f_type = F_FORW;
 	f->f_un.f_forw.f_addr = ai;
 	f->f_prevcount = 0;
+
+	if (!first)
+		NOTE("Successfully resolved '%s:%s', initiating forwarding.", host, serv);
 }
 
 void domark(void *arg)
@@ -2203,7 +2425,8 @@ void doflush(void *arg)
 	SIMPLEQ_FOREACH(f, &fhead, f_link) {
 		if (f->f_type == F_FORW_UNKN) {
 			forw_lookup(f);
-			continue;
+			if (f->f_type != F_FORW)
+				continue;
 		}
 
 		if (f->f_prevcount && timer_now() >= REPEATTIME(f)) {
@@ -2244,8 +2467,10 @@ static void close_open_log_files(void)
 			break;
 
 		case F_FORW:
-			if (f->f_un.f_forw.f_addr)
+			if (f->f_un.f_forw.f_addr) {
 				freeaddrinfo(f->f_un.f_forw.f_addr);
+				f->f_un.f_forw.f_addr = NULL;
+			}
 			break;
 		}
 
@@ -2261,6 +2486,11 @@ void die(int signo)
 		logit("syslogd: exiting on signal %d\n", signo);
 		flog(LOG_SYSLOG | LOG_INFO, "exiting on signal %d", signo);
 	}
+
+	/*
+	 * Stop all active timers
+	 */
+	timer_exit();
 
 	/*
 	 * Close all open log files.
@@ -2409,6 +2639,7 @@ static void signal_init(void)
 	SIGNAL(SIGINT,  Debug ? die : SIG_IGN);
 	SIGNAL(SIGQUIT, Debug ? die : SIG_IGN);
 	SIGNAL(SIGUSR1, Debug ? debug_switch : SIG_IGN);
+	SIGNAL(SIGUSR2, signal_rotate);
 #ifdef SIGXFSZ
 	SIGNAL(SIGXFSZ, SIG_IGN);
 #endif
@@ -2422,7 +2653,10 @@ static void boot_time_init(void)
 	struct sysinfo si;
 	struct timeval tv;
 
-	gettimeofday(&tv, NULL);
+	if (gettimeofday(&tv, NULL) == -1) {
+		tv.tv_sec  = time(NULL);
+		tv.tv_usec = 0;
+	}
 	sysinfo(&si);
 	boot_time = tv.tv_sec - si.uptime;
 #endif
@@ -2433,9 +2667,10 @@ static void boot_time_init(void)
  */
 static void init(void)
 {
-	static int once = 1;
-	struct filed *f;
+	struct notifiers newn = SIMPLEQ_HEAD_INITIALIZER(newn);
 	struct files newf = SIMPLEQ_HEAD_INITIALIZER(newf);
+	struct filed *f;
+	struct peer *pe;
 	FILE *fp;
 	char *p;
 
@@ -2482,23 +2717,6 @@ static void init(void)
 	}
 
 	/*
-	 * Open sockets for local and remote communication
-	 */
-	if (once) {
-		struct peer *pe;
-
-		/* Only once at startup */
-		once = 0;
-
-		SIMPLEQ_FOREACH(pe, &pqueue, pe_link) {
-			if (pe->pe_name && pe->pe_name[0] == '/')
-				create_unix_socket(pe);
-			else if (SecureMode < 2)
-				create_inet_socket(pe);
-		}
-	}
-
-	/*
 	 * Load / reload timezone data (in case it changed)
 	 */
 	tzset();
@@ -2512,12 +2730,12 @@ static void init(void)
 
 		fp = cftemp();
 		if (!fp) {
-			logit("Cannot even create a tempfile: %s", strerror(errno));
+			logit("Cannot even create a tempfile: %s\n", strerror(errno));
 			return;
 		}
 	}
 
-	if (cfparse(fp, &newf)) {
+	if (cfparse(fp, &newf, &newn)) {
 		fclose(fp);
 		return;
 	}
@@ -2527,11 +2745,43 @@ static void init(void)
 	 * Close all open log files.
 	 */
 	close_open_log_files();
+
 	fhead = newf;
+
+	/*
+	 * Free all notifiers
+	 */
+	notifier_free_all();
+
+	nothead = newn;
+
+	/*
+	 * Open or close sockets for local and remote communication
+	 */
+	SIMPLEQ_FOREACH(pe, &pqueue, pe_link) {
+		if (pe->pe_name && pe->pe_name[0] == '/') {
+			create_unix_socket(pe);
+		} else {
+			for (size_t i = 0; i < pe->pe_socknum; i++)
+				socket_close(pe->pe_sock[i]);
+			pe->pe_socknum = 0;
+
+			if (SecureMode < 2)
+				create_inet_socket(pe);
+		}
+	}
 
 	Initialized = 1;
 
 	if (Debug) {
+		if (!SIMPLEQ_EMPTY(&nothead)) {
+			struct notifier *np;
+
+			SIMPLEQ_FOREACH(np, &nothead, n_link)
+				printf("notify %s\n", np->n_program);
+			printf("\n");
+		}
+
 		SIMPLEQ_FOREACH(f, &fhead, f_link) {
 			if (f->f_type == F_UNUSED)
 				continue;
@@ -2662,7 +2912,7 @@ static struct filed *cfline(char *line)
 	int syncfile, pri;
 	int i, i2;
 
-	logit("cfline(%s)\n", line);
+	logit("cfline[%s]\n", line);
 
 	f = calloc(1, sizeof(*f));
 	if (!f) {
@@ -2900,10 +3150,46 @@ static struct filed *cfline(char *line)
 }
 
 /*
+ * Find matching cfkey and modify cline to the argument.
+ * Note, the key '=' value separator is optional.
+ */
+const struct cfkey *cfkey_match(char *cline)
+{
+	size_t i;
+
+	for (i = 0; i < NELEMS(cfkey); i++) {
+		const struct cfkey *cfk = &cfkey[i];
+		size_t len = strlen(cfk->key);
+		char *p;
+
+		if (strncmp(cline, cfk->key, len))
+			continue;
+
+		p = &cline[len];
+		while (*p && isspace(*p))
+			p++;
+		if (*p == '=')
+			p++;
+		while (*p && isspace(*p))
+			p++;
+
+		if (cfk->var)
+			*cfk->var = strdup(p);
+		else
+			memmove(cline, p, strlen(p) + 1);
+
+		return cfk;
+	}
+
+	return NULL;
+}
+
+/*
  * Parse .conf file and append to list
  */
-static int cfparse(FILE *fp, struct files *newf)
+static int cfparse(FILE *fp, struct files *newf, struct notifiers *newn)
 {
+	const struct cfkey *cfk;
 	struct filed *f;
 	char  cbuf[BUFSIZ];
 	char *cline;
@@ -2944,10 +3230,10 @@ static int cfparse(FILE *fp, struct files *newf)
 
 		*++p = '\0';
 
-		if (!strncmp(cbuf, "include", 7)) {
+		if (!strncmp(cline, "include", 7)) {
 			glob_t gl;
 
-			p = &cbuf[7];
+			p = &cline[7];
 			while (*p && isspace(*p))
 				p++;
 
@@ -2966,19 +3252,39 @@ static int cfparse(FILE *fp, struct files *newf)
 					continue;
 				}
 
-				logit("Parsing %s ...", gl.gl_pathv[i]);
-				cfparse(fpi, newf);
+				logit("Parsing %s ...\n", gl.gl_pathv[i]);
+				cfparse(fpi, newf, newn);
 				fclose(fpi);
 			}
 			globfree(&gl);
 			continue;
 		}
 
-		f = cfline(cbuf);
+		cfk = cfkey_match(cline);
+		if (cfk) {
+			if (!strcmp(cfk->key, "notify"))
+				notifier_add(newn, cline);
+			continue;
+		}
+
+		f = cfline(cline);
 		if (!f)
 			continue;
 
 		SIMPLEQ_INSERT_TAIL(newf, f, f_link);
+	}
+
+	if (secure_str) {
+		int val;
+
+		val = atoi(secure_str);
+		if (val < 0 || val > 2)
+			logit("Invalid value to secure_mode = %s\n", secure_str);
+		else
+			secure_mode = val;
+
+		free(secure_str);
+		secure_str = NULL;
 	}
 
 	return 0;
@@ -3316,6 +3622,70 @@ static void logit(char *fmt, ...)
 	fflush(stdout);
 }
 
+static void notifier_add(struct notifiers *newn, const char *program)
+{
+	while (*program && isspace(*program))
+		++program;
+
+	/* Check whether it is accessible, regardless of TOCTOU */
+	if (!access(program, X_OK)) {
+		struct notifier *np;
+
+		np = calloc(1, sizeof(*np));
+		if (!np) {
+			ERR("Cannot allocate memory for a notify program");
+			return;
+		}
+		np->n_program = strdup(program);
+		if (!np->n_program) {
+			free (np);
+			ERR("Cannot allocate memory for a notify program");
+			return;
+		}
+		SIMPLEQ_INSERT_TAIL(newn, np, n_link);
+	} else
+		logit("notify: non-existing, or not executable program\n");
+}
+
+static void notifier_invoke(const char *logfile)
+{
+	char *argv[3];
+	int childpid;
+	struct notifier *np;
+
+	logit("notify: rotated %s, invoking hooks\n", logfile);
+
+	SIMPLEQ_FOREACH(np, &nothead, n_link) {
+		childpid = fork();
+
+		switch (childpid) {
+		case -1:
+			ERR("Cannot start notifier %s", np->n_program);
+			break;
+		case 0:
+			argv[0] = np->n_program;
+			argv[1] = (char*)logfile;
+			argv[2] = NULL;
+			execv(argv[0], argv);
+			_exit(1);
+		default:
+			logit("notify: forked child pid %d for %s\n",
+				childpid, np->n_program);
+			break;
+		}
+	}
+}
+
+static void notifier_free_all(void)
+{
+	struct notifier *np, *npnext;
+
+	SIMPLEQ_FOREACH_SAFE(np, &nothead, n_link, npnext) {
+		free(np->n_program);
+		free(np);
+	}
+}
+
 /*
  * The following function is resposible for handling a SIGHUP signal.  Since
  * we are now doing mallocs/free as part of init we had better not being
@@ -3325,6 +3695,15 @@ static void logit(char *fmt, ...)
 void reload(int signo)
 {
 	restart++;
+}
+
+/*
+ * SIGUSR2: forced rotation for so-configured files as soon as possible.
+ */
+static void signal_rotate(int sig)
+{
+	(void)sig;
+	rotate_signal++;
 }
 
 /**

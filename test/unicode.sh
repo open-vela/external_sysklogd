@@ -1,19 +1,18 @@
 #!/bin/sh
+# Currently only same as local.sh but with unicode messages
+# From https://github.com/troglobit/sysklogd/issues/49
 # shellcheck disable=SC1090
-
 if [ x"${srcdir}" = x ]; then
     srcdir=.
 fi
 
 . ${srcdir}/lib.sh
-setup
+setup -8
 
-print "TEST: Starting"
+MSG="öäüÖÄÜß€¢§"
+MSG2="…‘’•"
 
-MSG="foobar"
-MSG2="xyzzy"
-
-logger "${MSG}"
+logger ${MSG}
 grep ${MSG} "${LOG}" || FAIL "Cannot find: ${MSG}"
 
 logger "${ALTSOCK}" ${MSG2}
