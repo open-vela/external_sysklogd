@@ -2418,20 +2418,13 @@ static void signal_init(void)
 
 static void boot_time_init(void)
 {
-#ifdef __linux__
+#if defined(__linux__) || defined(__NuttX__)
 	struct sysinfo si;
 	struct timeval tv;
 
 	gettimeofday(&tv, NULL);
 	sysinfo(&si);
 	boot_time = tv.tv_sec - si.uptime;
-#else
-	struct timespec mts;
-	struct timespec rts;
-
-	clock_gettime(CLOCK_MONOTONIC, &mts);
-	clock_gettime(CLOCK_REALTIME, &rts);
-	boot_time = rts.tv_sec - mts.tv_sec;
 #endif
 }
 
