@@ -4,101 +4,7 @@ Change Log
 All relevant changes to the project are documented in this file.
 
 
-[v2.4.4][] - 2022-08-14
------------------------
-
-### Fixes
-- Fix #58: running syslogd with `-T` should use local time for remote
-  messages, but time is always logged with "Jan 0 00:00:00".
-
-
-[v2.4.3][] - 2022-08-12
------------------------
-
-### Changes
-- Ensure output from `syslogd -v` and `logger -v` is the same, so
-  that the project origin is the same, and that both use stdout
-
-### Fixes
-- Fix #57: garbled tag name in std (RFC3164) log file output
-
-
-[v2.4.2][] - 2022-08-01
------------------------
-
-### Fixes
-- Fix `logger` default severity, use **.notice**, like other logger
-  implementations.  Was .info, which is of lesser severity, affecting
-  some use-cases negatively (loss of logs)
-- Drop extra leading space in log message in libsyslog RFC3164 format,
-  two spaces between `proc[pid]:`, or plain `:`, and the message
-- Drop trailing space in `logger` messages read from command line
-
-
-[v2.4.1][] - 2022-08-01
------------------------
-
-### Changes
-- Fake microsecond timestamp to allow for improved log sorting:
-  - in RFC3164 messages (that don't have this resolution)
-  - in untrusted kernel messages
-- Dropped `debian/` directory (moved to separate branch), to ease
-  re-packaging by downstream
-- libsyslog now supports logging to remote servers, bypassing syslogd
-- Major updates to `logger`:
-  - Support for logging to a remote host, `-h HOST` and `-P PORT`
-  - Support for logging in RFC3164 format, `-b`, mostly for remote
-    logging to syslog servers that do not support RFC5424
-  - Support for overriding hostname `-H NAME`
-  - Support for custom PID, e.g., a shell scripts PID, `-I PID`
-
-### Fixes
-- Fix #52: Prevent over-read when scanning a new-style kernel message.
-  Found and fixed by Edward K. McGuire
-- Fix #53: prevent log file corruption when kernel messages contain
-  control codes, notably `\n`.  Instead, preserve kernel protective
-  C-style hex encoding.  For example, `\n` embedded in a message by a
-  kernel-level facility is received as `\x0a`.  Found and fixed by
-  Edward K. McGuire
-- Fix #56: logging to remote machine stops after receiving a few
-  SIGHUPs.  Open remote socket count was not reset properly on SIGHUP.
-  Problem introduced in v2.4.0.  Reported by Edward K. McGuire
-- Fix `gettimeofday()` error handling to use same fallback to `time()`
-- Fix libsyslog opening and connecting to syslogd when `LOG_NLOG` is set
-- Fix libsyslog so it honors `LOG_PTRIM` when logging to stderr
-- Fix issue in RFC3164 output where the tag field could overflow.
-  Spec. mandates tag never exceeds 32 characters
-
-[v2.4.0][] - 2022-05-29
------------------------
-
-### Changes
-- Add support for `secure_mode=[0,1,2]` to syslog.conf, same as `-s`
-  but easier to use and activate with SIGHUP
-- Enable `secure_mode=1` (only log to remote servers) in default `syslog.conf`
-- Disable debug messages, in default `syslog.conf`, from `/var/log/syslog`
-- Rename option `-K` to `-t` for trusting kernel timestamp, issue #42
-- Add option `-K` to disable kernel logging, issue #48
-- Rudimentary support for detecting if running in a container and then
-  disable kernel logging automatically, issue #48
-- Add support for `notify PATH` option to syslog.conf, for calling an
-  external script on log rotation, by Steffen Nurpmeso, issue #45
-- Add support for log rotation on SIGUSR2, by Steffen Nurpmeso, issue #46
-- Update manual page for `-b` option description
-
-### Fixes
-- Issue #41: add missing `-H` option to usage text
-- Issue #44: option misspelled in man page
-- Issue #47: do not lose file mode on rotated files, by Steffen Nurpmeso
-- Issue #48: verify kernel log FIFO is a proper character device, for
-  running in certain container setups
-- Issue #49: add support for `-8` command line option to allow 8-bit
-  data to be logged -- this is a temporary fix until we have support
-  for parsing the Unicode BOM, as defined in RFC5424
-- Issue #50: fix issue with wall message, by Edward K. McGuire
-
-
-[v2.3.0][] - 2021-11-27
+[v2.3.0][UNRELEASED]
 -----------------------
 
 ### Changes
@@ -108,29 +14,14 @@ All relevant changes to the project are documented in this file.
 - Ignore `EINVAL` from kernel, caused warning message at first startup
 - Use journald socket on systemd systems, not `/dev/log`
 - Issue #38: add support for `syslogd -C file` to use `file` for caching
-  the last seen kernel sequence number, default: `/run/syslogd.cache`.
-  **Note:** syslogd relies on the location of this file to be wiped at
-  system boot.  The default, `/run`, is a RAM disk on modern systems
+  the last seen kernel sequence number, default: `/run/syslogd.cache`
+
 
 ### Fixes
 - Issue #34: regression in v2.2.3, causing loss of syslogd log messages
   like `syslogd v2.2.3: restart.`
 - Issue #35: man pages lists `-v` as verbose mode, is actually version
-- Issue #36: retry DNS lookup of remote syslog servers with `res_init()`
-  to ensure name resolution at bootup when a remote DNS may temporarily
-  be unreachable.  Retry at most every five seconds, to prevent syslogd
-  from monopolizing the CPU when emptying the kernel ring buffer
 - Issue #39: update tests to use `-P fn` and `-C fn`
-- Issue #40: improve documentation for syslogd.cache file requirements
-- Issue #41: add missing documentation for -H option
-- Issue #42: add option (`-K`) to always trust kernel timestamp.  By
-  default `syslogd` only trusts the kernel timestamp for the initial
-  emptying of the kernel ring buffer
-- Issue #43: avoid asserting (exiting) on and around Jan 19, 2038, when
-  the UNIX epoch wraps around on 32-bit `time_t` systems
-- libsyslog: handle `EOVERFLOW` from `gettimeofday()` on Jan 19, 2038
-- Avoid `NULL` pointers to internal `logit()` function, only triggered
-  when in debug mode
 - Replace `\m` with `\n` (missing newline) in `logger` usage text
 
 
@@ -339,7 +230,7 @@ and a replacement for `syslog.h` to enable new features in RFC5424.
 
 ### Changes
 - Support for true RFC3164 formatted log messages to remote log servers,
-  including timestamp and hostname.  Use `;RFC3164` rule option
+  including timestamp and hostname.  Use `;RFC3161` rule option
 - Support for RFC5424 from UNIX domain socket, from remote servers and also
   to remote servers.  Requires new API `syslogp()` to unlock these features
   on the UNIX socket.  Still compatible with GLIBC/musl/uClibc
@@ -525,11 +416,7 @@ and a replacement for `syslog.h` to enable new features in RFC5424.
 - Several bugfixes and improvements, please refer to the .c files
 
 
-[UNRELEASED]: https://github.com/troglobit/sysklogd/compare/v2.4.3...HEAD
-[v2.4.3]:     https://github.com/troglobit/sysklogd/compare/v2.4.2...v2.4.3
-[v2.4.2]:     https://github.com/troglobit/sysklogd/compare/v2.4.1...v2.4.2
-[v2.4.1]:     https://github.com/troglobit/sysklogd/compare/v2.4.0...v2.4.1
-[v2.4.0]:     https://github.com/troglobit/sysklogd/compare/v2.3.0...v2.4.0
+[UNRELEASED]: https://github.com/troglobit/sysklogd/compare/v2.2.3...HEAD
 [v2.3.0]:     https://github.com/troglobit/sysklogd/compare/v2.2.3...v2.3.0
 [v2.2.3]:     https://github.com/troglobit/sysklogd/compare/v2.2.2...v2.2.3
 [v2.2.2]:     https://github.com/troglobit/sysklogd/compare/v2.2.1...v2.2.2

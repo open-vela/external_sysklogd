@@ -8,6 +8,8 @@
 <23>Aug 24 05:14:15 192.0.2.1 myproc[8710]: Kilroy was here.
 <23>1 2019-11-04T00:50:15.001234+01:00 troglobit myproc 8710 - - Kilroy was here.
 ```
+<a href="https://repology.org/project/sysklogd/versions"><img align="right" alt="Packaging status"
+   src="https://repology.org/badge/vertical-allrepos/sysklogd.svg"></a>
 [![BSD Badge][]][BSD License] [![GitHub Status][]][GitHub] [![Coverity Status][]][Coverity Scan]
 
 Table of Contents
@@ -19,10 +21,6 @@ Table of Contents
 * [Building from GIT](#building-from-git)
 * [Origin & References](#origin--references)
 
-> **Tip:** the Gentoo project has a very nice article detailing sysklogd
-> ➤ <https://wiki.gentoo.org/wiki/Sysklogd>
-
-
 Introduction
 ------------
 
@@ -32,14 +30,12 @@ FreeBSD.  The package includes the `libsyslog.{a,so}` library with a
 `syslog.h` header replacement, the `syslogd` daemon, and a command
 line tool called `logger`.
 
-- https://man.troglobit.com/man1/logger.1.html
-- https://man.troglobit.com/man8/syslogd.8.html
-- https://man.troglobit.com/man5/syslog.conf.5.html
-
 `libsyslog` and `syslog/syslog.h`, derived directly from NetBSD, expose
 `syslogp()` and other new features available only in [RFC5424][]:
 
 - https://man.troglobit.com/man3/syslogp.3.html
+- https://man.troglobit.com/man8/syslogd.8.html
+- https://man.troglobit.com/man5/syslog.conf.5.html
 - https://netbsd.gw.com/cgi-bin/man-cgi?syslog+3+NetBSD-current
 
 The `syslogd` daemon is an enhanced version of the standard Berkeley
@@ -50,14 +46,9 @@ with standard C-library implementations of the `syslog()` API (GLIBC,
 musl libc, uClibc), `libsyslog` must be used in your application to
 unlock the new [RFC5424][] `syslogp()` API.
 
-The included `logger` tool is primarily made for use with sysklogd, but
-can be used stand-alone too.  It is not command line compatible with the
-"standard" Linux logger tool from the bsdutils project.  Instead it is
-compatible with the actual BSD logger tool(s) -- only major difference
-is its support for `-I PID`, similar to the bsdutils `--id=PID`.  The
-`logger` tool can be used from the command line, or script, to send both
-RFC5424 (default) and old-style (BSD) RFC3164 formatted messages using
-`libsyslog` to `syslogd` for local processing, or to a remote server.
+The included `logger` tool can be used from the command line, or script,
+to send RFC5424 formatted messages using `libsyslog` to `syslogd` for
+local or remote logging.
 
 Main differences from the original sysklogd package are:
 
@@ -76,17 +67,13 @@ Main differences from the original sysklogd package are:
 - Support for remote peer filtering, from FreeBSD
 - Support for disabling DNS reverse lookups for each remote log message
 - Support for FreeBSD Secure Mode, remote logging enabled by default(!)
-- Includes a fit for purpose `logger` tool, compatible with `syslogd`,
-  leveraging the full RFC5424 capabilities (`msgid` etc.)
+- Includes a `logger` tool with RFC5424 capabilities (`msgid` etc.)
 - Includes a syslog library and system header replacement for logging
 - FreeBSD socket receive buffer size patch
 - Avoid blocking `syslogd` if console is backed up
 - Touch PID file on `SIGHUP`, for integration with [Finit][]
 - GNU configure & build system to ease porting/cross-compiling
 - Support for configuring remote syslog timeout
-
-Please file bug reports, or send pull requests for bug fixes and/or
-proposed extensions at [GitHub][Home].
 
 
 Using -lsyslog
@@ -189,14 +176,9 @@ Origin & References
 
 This is the continuation of the original sysklogd by Dr. G.W. Wettstein
 and [Martin Schulze][].  Currently maintained, and almost completely
-rewritten by [Joachim Wiberg][], who spliced in fresh DNA strands from
-the NetBSD and FreeBSD projects.  Much of the code base is NetBSD, but
-the command line interface is FreeBSD.
-
-> **Note:** the project name remains `sysklogd`, which was a combination
-> of the names of the two main daemons, `syslogd` and `klogd`.  However,
-> since v2.0 `klogd` no longer exists, kernel logging is now native to
-> `syslogd`.
+rewritten with the latest DNA strands from NetBSD and FreeBSD, by
+[Joachim Wiberg][].  Please file bug reports, or send pull requests for
+bug fixes and proposed extensions at [GitHub][Home].
 
 The project was previously licensed under the GNU GPL, but since the
 removal of `klogd`, man pages, and resync with the BSDs the project is

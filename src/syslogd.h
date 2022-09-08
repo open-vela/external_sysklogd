@@ -49,11 +49,13 @@
 #include "queue.h"
 #include "syslog.h"
 
+#ifndef MAXLINE
 #define MAXLINE        2048            /* maximum line length */
+#endif
 #define MAXSVLINE      MAXLINE         /* maximum saved line length */
 #define DEFUPRI        (LOG_USER | LOG_NOTICE)
 #define DEFSPRI        (LOG_KERN | LOG_CRIT)
-#define TIMERINTVL     30              /* interval for checking flush/nslookup */
+#define TIMERINTVL     30              /* interval for checking flush/nslookip */
 #define RCVBUF_MINSIZE (80 * MAXLINE)  /* minimum size of dgram rcv buffer */
 
 /*
@@ -183,7 +185,6 @@
 #define MARK      0x008  /* this message is a mark */
 #define RFC3164   0x010  /* format log message according to RFC 3164 */
 #define RFC5424   0x020  /* format log message according to RFC 5424 */
-#define SUSP_RETR 0x040  /* suspend/forw_unkn, retrying nslookup */
 
 /* Syslog timestamp formats. */
 #define	BSDFMT_DATELEN	0
@@ -303,14 +304,6 @@ struct filed {
 	int	 f_flags;                      /* store some additional flags */
 	int	 f_rotatecount;
 	int	 f_rotatesz;
-};
-
-/*
- * Log rotation notifiers
- */
-struct notifier {
-	SIMPLEQ_ENTRY(notifier)	 n_link;
-	char			*n_program;
 };
 
 void flog(int pri, char *fmt, ...);

@@ -34,7 +34,6 @@
 #ifndef _SYS_SYSLOG_H_ /* From NetBSD, for co-existance with C-library header */
 #define _SYS_SYSLOG_H_
 
-#include <features.h>
 #include <stdarg.h>
 
 /*
@@ -80,6 +79,7 @@
 				/* mark "facility" */
 #define INTERNAL_ALLPRI 0xFF   /* Value to indicate all priorities in f_pmask */
 #define	INTERNAL_MARK	LOG_MAKEPRI(LOG_NFACILITIES << 3, 0)
+#undef CODE
 typedef struct _code {
 	const char	*c_name;
 	int	c_val;
@@ -187,10 +187,9 @@ CODE facilitynames[] = {
 #define	LOG_NDELAY	0x008	/* don't delay open */
 #define	LOG_NOWAIT	0x010	/* don't wait for console forks: DEPRECATED */
 #define	LOG_PERROR	0x020	/* log to stderr as well */
-#define	LOG_PTRIM	0x040	/* trim anything syslog addded when writing to stderr */
+#define	LOG_PTRIM	0x040	/* trim tag and pid from messages to stderr */
 #define	LOG_NLOG	0x080	/* don't write to the system log */
 #define	LOG_STDOUT	0x100	/* like nlog, for debugging syslogp() API */
-#define	LOG_RFC3164     0x200	/* Log to remote/ipc socket in old BSD format */
 
 #ifndef __KERNEL__
 
@@ -207,8 +206,6 @@ struct syslog_data {
 	char	log_hostname[256];	/* MAXHOSTNAMELEN */
 	int	log_fac;
 	int	log_mask;
-	void	*log_host;		/* struct sockaddr* */
-	int     log_pid;
 };
 
 #define SYSLOG_DATA_INIT { \
@@ -222,8 +219,6 @@ struct syslog_data {
     .log_hostname = { '\0' }, \
     .log_fac = LOG_USER, \
     .log_mask = 0xff, \
-    .log_host = NULL, \
-    .log_pid = -1, \
 }
 
 #ifdef __cplusplus
